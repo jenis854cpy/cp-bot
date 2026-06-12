@@ -1,0 +1,17 @@
+{
+  "name": "cf-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Codeforces WhatsApp Group Bot using Baileys",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.6.0",
+    "express": "^4.18.0",
+    "mongoose": "^8.0.0",
+    "pino": "^8.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
