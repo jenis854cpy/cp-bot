@@ -9,7 +9,11 @@ const {
   proto,
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode");
 const axios = require("axios");
+
+// Holds the latest QR string so the web endpoint can serve it
+let latestQR = null;
 const pino = require("pino");
 
 // ─── MongoDB Connect ───────────────────────────────────────────────────────────
@@ -352,10 +356,39 @@ async function checkAndAnnounceWinner(sock) {
   }
 }
 
-// ─── Express Server (for UptimeRobot keep-alive) ──────────────────────────────
+// ─── Express Server ───────────────────────────────────────────────────────────
 const app = express();
+
 app.get("/", (req, res) => res.send("✅ CF WhatsApp Bot is running!"));
 app.get("/ping", (req, res) => res.send("🏓 Pong!"));
+
+// Visit /qr in your browser to scan the WhatsApp QR code
+app.get("/qr", async (req, res) => {
+  if (!latestQR) {
+    return res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+        <h2>✅ Bot is already connected!</h2>
+        <p>No QR code needed. The bot is live.</p>
+        <p><a href="/">Back to status</a></p>
+      </body></html>
+    `);
+  }
+  try {
+    const qrImageUrl = await QRCode.toDataURL(latestQR);
+    res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#0a0a0a;color:#fff">
+        <h2>📱 Scan with WhatsApp</h2>
+        <p style="color:#aaa">Open WhatsApp → Linked Devices → Link a Device</p>
+        <img src="${qrImageUrl}" style="width:280px;height:280px;border:8px solid #fff;border-radius:12px" />
+        <p style="color:#aaa;font-size:13px">Page auto-refreshes every 20 seconds. QR expires in ~60s.</p>
+        <script>setTimeout(() => location.reload(), 20000);</script>
+      </body></html>
+    `);
+  } catch (e) {
+    res.status(500).send("Error generating QR: " + e.message);
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Express server on port ${PORT}`));
 
@@ -377,8 +410,9 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("\n📱 Scan this QR code with WhatsApp:\n");
-      qrcode.generate(qr, { small: true });
+      latestQR = qr; // serve via /qr endpoint
+      console.log("\n📱 QR ready! Open your Render URL + /qr to scan.\n");
+      qrcode.generate(qr, { small: true }); // also print in logs as fallback
     }
 
     if (connection === "close") {
@@ -394,6 +428,7 @@ async function startBot() {
     }
 
     if (connection === "open") {
+      latestQR = null; // clear QR — bot is connected
       console.log("\n✅ CF WhatsApp Bot is ready!");
       console.log("Commands: // add, // remove, // rating, // myrating, // upcoming, // solved, // help\n");
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
