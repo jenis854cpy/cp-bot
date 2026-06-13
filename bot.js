@@ -1,5 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
+const QRCode = require("qrcode");
 const {
   default: makeWASocket,
   DisconnectReason,
@@ -9,54 +10,40 @@ const {
   proto,
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
-const QRCode = require("qrcode");
 const axios = require("axios");
 const pino = require("pino");
 
-// Holds latest QR for /qr web endpoint
 let latestQR = null;
 
-// ─── MongoDB Connect ───────────────────────────────────────────────────────────
+// ─── MongoDB ───────────────────────────────────────────────────────────────────
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB Connected"))
-  .catch((err) => {
-    console.error("❌ MongoDB Error:", err.message);
-    process.exit(1);
-  });
+  .catch((err) => { console.error("❌ MongoDB Error:", err.message); process.exit(1); });
 
-// ─── Schemas ──────────────────────────────────────────────────────────────────
-const AuthState = mongoose.model(
-  "AuthState",
-  new mongoose.Schema({ _id: String, data: mongoose.Schema.Types.Mixed })
-);
+const AuthState = mongoose.model("AuthState",
+  new mongoose.Schema({ _id: String, data: mongoose.Schema.Types.Mixed }));
 
-const CFData = mongoose.model(
-  "CFData",
+const CFData = mongoose.model("CFData",
   new mongoose.Schema({
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
     lastContestAnnounced: { type: Number, default: 0 },
-  })
-);
+  }));
 
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
 async function useMongoAuthState() {
   const writeData = async (key, data) => {
-    await AuthState.findByIdAndUpdate(
-      key,
+    await AuthState.findByIdAndUpdate(key,
       { data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) },
-      { upsert: true }
-    );
+      { upsert: true });
   };
   const readData = async (key) => {
     const item = await AuthState.findById(key).lean();
     if (!item?.data) return null;
     return JSON.parse(JSON.stringify(item.data), BufferJSON.reviver);
   };
-  const removeData = async (key) => {
-    await AuthState.findByIdAndDelete(key);
-  };
+  const removeData = async (key) => { await AuthState.findByIdAndDelete(key); };
   const creds = (await readData("creds")) || initAuthCreds();
   return {
     state: {
@@ -64,14 +51,12 @@ async function useMongoAuthState() {
       keys: {
         get: async (type, ids) => {
           const data = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(`${type}-${id}`);
-              if (type === "app-state-sync-key" && value)
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-              data[id] = value;
-            })
-          );
+          await Promise.all(ids.map(async (id) => {
+            let value = await readData(`${type}-${id}`);
+            if (type === "app-state-sync-key" && value)
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            data[id] = value;
+          }));
           return data;
         },
         set: async (data) => {
@@ -89,7 +74,7 @@ async function useMongoAuthState() {
   };
 }
 
-// ─── CF Data Helpers ──────────────────────────────────────────────────────────
+// ─── Group Data ────────────────────────────────────────────────────────────────
 async function getGroupData(chatId) {
   const group = await CFData.findOne({ chatId }).lean();
   if (!group) return { members: {}, lastContestAnnounced: 0 };
@@ -97,11 +82,9 @@ async function getGroupData(chatId) {
 }
 
 async function saveGroupData(chatId, groupData) {
-  await CFData.findOneAndUpdate(
-    { chatId },
+  await CFData.findOneAndUpdate({ chatId },
     { $set: { members: groupData.members, lastContestAnnounced: groupData.lastContestAnnounced } },
-    { upsert: true }
-  );
+    { upsert: true });
 }
 
 function getAllHandles(groupData) {
@@ -111,6 +94,8 @@ function getAllHandles(groupData) {
       if (!all.includes(h)) all.push(h);
   return all;
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── Codeforces API ───────────────────────────────────────────────────────────
 async function getCFUser(handle) {
@@ -129,33 +114,26 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
-// ── CF Streak ─────────────────────────────────────────────────────────────────
+// ─── Streak ───────────────────────────────────────────────────────────────────
 async function getCFStreak(handle) {
   try {
     const res = await axios.get(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`, { timeout: 15000 });
     const subs = res.data.result;
-    // Get unique days with at least one AC
     const acDays = new Set();
-    for (const s of subs) {
-      if (s.verdict === "OK") {
-        const day = new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10);
-        acDays.add(day);
-      }
-    }
-    const sortedDays = [...acDays].sort();
-    if (!sortedDays.length) return { current: 0, max: 0 };
+    for (const s of subs)
+      if (s.verdict === "OK")
+        acDays.add(new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10));
 
-    // Calculate max streak
+    const sortedDays = [...acDays].sort();
+    if (!sortedDays.length) return { current: 0, max: 0, lastSolvedDate: null };
+
     let maxStreak = 1, cur = 1;
     for (let i = 1; i < sortedDays.length; i++) {
-      const prev = new Date(sortedDays[i - 1]);
-      const curr = new Date(sortedDays[i]);
-      const diff = (curr - prev) / (1000 * 60 * 60 * 24);
+      const diff = (new Date(sortedDays[i]) - new Date(sortedDays[i - 1])) / 86400000;
       if (diff === 1) { cur++; maxStreak = Math.max(maxStreak, cur); }
       else cur = 1;
     }
 
-    // Calculate current streak (from today backwards)
     const today = new Date().toISOString().slice(0, 10);
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     let currentStreak = 0;
@@ -167,21 +145,24 @@ async function getCFStreak(handle) {
         else break;
       }
     }
-    return { current: currentStreak, max: maxStreak };
+
+    const lastSolvedDate = sortedDays[sortedDays.length - 1];
+    return { current: currentStreak, max: maxStreak, lastSolvedDate };
   } catch { return null; }
 }
 
-// ── CF User Info (solved count + rating distribution) ─────────────────────────
+// ─── CF User Info ─────────────────────────────────────────────────────────────
 async function getCFUserInfo(handle) {
   try {
-    const [userRes, subRes] = await Promise.all([
+    const [userRes, subRes, ratingRes] = await Promise.all([
       axios.get(`https://codeforces.com/api/user.info?handles=${handle}`, { timeout: 8000 }),
       axios.get(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`, { timeout: 15000 }),
+      axios.get(`https://codeforces.com/api/user.rating?handle=${handle}`, { timeout: 8000 }),
     ]);
     const u = userRes.data.result[0];
     const subs = subRes.data.result;
+    const contests = ratingRes.data.result?.length ?? 0;
 
-    // Unique solved problems
     const solved = new Set();
     const ratingBuckets = {};
     for (const s of subs) {
@@ -190,54 +171,65 @@ async function getCFUserInfo(handle) {
         if (!solved.has(key)) {
           solved.add(key);
           const r = s.problem.rating;
-          if (r) {
-            ratingBuckets[r] = (ratingBuckets[r] || 0) + 1;
-          }
+          if (r) ratingBuckets[r] = (ratingBuckets[r] || 0) + 1;
         }
       }
     }
-
     return {
-      handle: u.handle,
-      rating: u.rating ?? null,
-      maxRating: u.maxRating ?? null,
-      rank: u.rank ?? "newbie",
-      maxRank: u.maxRank ?? "newbie",
-      totalSolved: solved.size,
-      ratingBuckets,
+      handle: u.handle, rating: u.rating ?? null, maxRating: u.maxRating ?? null,
+      rank: u.rank ?? "newbie", maxRank: u.maxRank ?? "newbie",
+      totalSolved: solved.size, ratingBuckets, contests,
     };
   } catch { return null; }
 }
 
-// ── CF Contest functions ───────────────────────────────────────────────────────
+// ─── Contest Helpers ──────────────────────────────────────────────────────────
+async function getCFContestList() {
+  const res = await axios.get("https://codeforces.com/api/contest.list?gym=false", { timeout: 10000 });
+  return res.data.result;
+}
+
 async function getCFUpcoming() {
   try {
-    const res = await axios.get("https://codeforces.com/api/contest.list?gym=false", { timeout: 10000 });
-    return res.data.result.filter((c) => c.phase === "BEFORE").sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).slice(0, 3);
+    const list = await getCFContestList();
+    return list.filter((c) => c.phase === "BEFORE").sort((a, b) => a.startTimeSeconds - b.startTimeSeconds).slice(0, 3);
   } catch { return []; }
 }
 
 async function getRunningContest() {
   try {
-    const res = await axios.get("https://codeforces.com/api/contest.list?gym=false", { timeout: 10000 });
-    const running = res.data.result.filter((c) => c.phase === "CODING");
+    const list = await getCFContestList();
+    const running = list.filter((c) => c.phase === "CODING");
     return running.length ? running[0] : null;
   } catch { return null; }
 }
 
-async function getRecentFinishedContests(limit = 10) {
+async function getRecentFinishedContest() {
   try {
-    const res = await axios.get("https://codeforces.com/api/contest.list?gym=false", { timeout: 10000 });
-    return res.data.result.filter((c) => c.phase === "FINISHED").slice(0, limit);
-  } catch { return []; }
+    const list = await getCFContestList();
+    const finished = list.filter((c) => c.phase === "FINISHED");
+    return finished.length ? finished[0] : null;
+  } catch { return null; }
 }
 
-// ── FIXED: Contest standings with better handle matching ──────────────────────
+async function getContestDetails(contestId) {
+  try {
+    const res = await axios.get(
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+      { timeout: 12000 }
+    );
+    return {
+      problems: res.data.result.problems || [],
+      contest: res.data.result.contest,
+    };
+  } catch { return { problems: [], contest: null }; }
+}
+
 async function getContestStandings(contestId, handles) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`,
-      { timeout: 20000 }
+      { timeout: 25000 }
     );
     const rows = res.data.result.rows;
     const handleLower = handles.map((h) => h.toLowerCase());
@@ -245,64 +237,31 @@ async function getContestStandings(contestId, handles) {
 
     for (const row of rows) {
       const members = row.party.members.map((m) => m.handle.toLowerCase());
+      // bestSubmissionTimeSeconds > 0 is the most reliable "solved" indicator
       const acceptedCount = row.problemResults.filter(
-        (p) => p.points > 0 || (p.rejectedAttemptCount !== undefined && p.bestSubmissionTimeSeconds > 0)
+        (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
       ).length;
       for (const m of members) {
         const idx = handleLower.indexOf(m);
         if (idx !== -1) {
-          const origHandle = handles[idx];
-          // Keep highest solved count if handle appears multiple times (official + unofficial)
-          if (!solvedMap[origHandle] || acceptedCount > solvedMap[origHandle])
-            solvedMap[origHandle] = acceptedCount;
+          const orig = handles[idx];
+          if (!solvedMap[orig] || acceptedCount > solvedMap[orig])
+            solvedMap[orig] = acceptedCount;
         }
       }
     }
     return solvedMap;
   } catch (e) {
-    console.error("getContestStandings error:", e.message);
+    console.error("standings error:", e.message);
     return null;
   }
 }
 
-async function getContestProblems(contestId) {
-  try {
-    const res = await axios.get(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`, { timeout: 10000 });
-    return res.data.result.problems || [];
-  } catch { return []; }
-}
-
-// ── AtCoder upcoming (via unofficial API) ────────────────────────────────────
-async function getAtCoderUpcoming() {
-  try {
-    const res = await axios.get("https://atcoder-contests-calendar-api.vercel.app/api/contests", { timeout: 8000 });
-    const now = Date.now();
-    return res.data
-      .filter((c) => new Date(c.start_time).getTime() > now)
-      .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
-      .slice(0, 2);
-  } catch { return []; }
-}
-
-// ── CodeChef upcoming (via CLIST API or scrape fallback) ──────────────────────
-async function getCodeChefUpcoming() {
-  try {
-    const res = await axios.get(
-      "https://clist.by/api/v4/contest/?resource=codechef.com&upcoming=true&order_by=start&limit=2",
-      { timeout: 8000, headers: { Authorization: `ApiKey ${process.env.CLIST_API_KEY || ""}` } }
-    );
-    return (res.data.objects || []).slice(0, 2);
-  } catch { return []; }
-}
-
-// ── LeetCode upcoming ─────────────────────────────────────────────────────────
 async function getLeetCodeUpcoming() {
   try {
     const res = await axios.post(
       "https://leetcode.com/graphql",
-      {
-        query: `{ allContests { title startTime duration } }`,
-      },
+      { query: `{ allContests { title startTime duration } }` },
       { timeout: 8000, headers: { "Content-Type": "application/json" } }
     );
     const now = Math.floor(Date.now() / 1000);
@@ -311,6 +270,42 @@ async function getLeetCodeUpcoming() {
       .sort((a, b) => a.startTime - b.startTime)
       .slice(0, 2);
   } catch { return []; }
+}
+
+// ─── Winner Checker ───────────────────────────────────────────────────────────
+async function checkAndAnnounceWinner(sock) {
+  const groups = await CFData.find({}).lean();
+  for (const group of groups) {
+    const chatId = group.chatId;
+    if (!chatId.endsWith("@g.us")) continue;
+    const groupData = { members: group.members || {}, lastContestAnnounced: group.lastContestAnnounced || 0 };
+    const handles = getAllHandles(groupData);
+    if (!handles.length) continue;
+    try {
+      const lastContest = await getRecentFinishedContest();
+      if (!lastContest) continue;
+      const lastId = lastContest.id;
+      if (groupData.lastContestAnnounced === lastId) continue;
+      const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
+      const now = Math.floor(Date.now() / 1000);
+      if (now - finishedAt > 7200) { await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId }); continue; }
+      const solvedMap = await getContestStandings(lastId, handles);
+      if (!solvedMap) continue;
+      const entries = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+      if (!entries.length) continue;
+      const [winner, winnerSolved] = entries[0];
+      let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
+      text += `🏆 *Group Winner: ${winner}* with *${winnerSolved}* solved!\n\n📊 *Group Performance:*\n`;
+      entries.forEach(([h, s], i) => {
+        const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+        text += `${medal} *${h}* — ${s} solved\n`;
+      });
+      const notParticipated = handles.filter((h) => !solvedMap[h]);
+      if (notParticipated.length) text += `\n😴 Didn't participate: ${notParticipated.join(", ")}`;
+      await sock.sendMessage(chatId, { text });
+      await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
+    } catch (e) { console.error(`Winner check error ${chatId}:`, e.message); }
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -329,91 +324,60 @@ function rankEmoji(rank) {
   return "⚪";
 }
 
+function streakFire(days) {
+  if (days >= 30) return "🔥🔥🔥🔥";
+  if (days >= 15) return "🔥🔥🔥";
+  if (days >= 8)  return "🔥🔥";
+  if (days >= 1)  return "🔥";
+  return "💤";
+}
+
+function solvedEmoji(count) {
+  if (count >= 101) return "🚀";
+  if (count >= 61)  return "💫";
+  if (count >= 31)  return "🔥";
+  if (count >= 11)  return "⭐";
+  return "🌱";
+}
+
 function formatDuration(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function formatStartTime(unixSeconds) {
-  const d = new Date(unixSeconds * 1000);
-  return d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }) + " IST";
+function formatIST(unixSeconds) {
+  return new Date(unixSeconds * 1000).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata", day: "2-digit", month: "short",
+    year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true,
+  }) + " IST";
 }
 
-function formatDateStr(dateStr) {
-  const d = new Date(dateStr);
-  return d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }) + " IST";
-}
-
-// ─── Winner Checker ───────────────────────────────────────────────────────────
-async function checkAndAnnounceWinner(sock) {
-  const groups = await CFData.find({}).lean();
-  for (const group of groups) {
-    const chatId = group.chatId;
-    if (!chatId.endsWith("@g.us")) continue;
-    const groupData = { members: group.members || {}, lastContestAnnounced: group.lastContestAnnounced || 0 };
-    const handles = getAllHandles(groupData);
-    if (!handles.length) continue;
-    try {
-      const finished = await getRecentFinishedContests(5);
-      if (!finished.length) continue;
-      const lastContest = finished[0];
-      const lastId = lastContest.id;
-      if (groupData.lastContestAnnounced === lastId) continue;
-      const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
-      const now = Math.floor(Date.now() / 1000);
-      if (now - finishedAt > 7200) {
-        await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
-        continue;
-      }
-      const solvedMap = await getContestStandings(lastId, handles);
-      if (!solvedMap) continue;
-      const entries = Object.entries(solvedMap).filter(([, s]) => s > 0);
-      if (!entries.length) continue;
-      entries.sort((a, b) => b[1] - a[1]);
-      const [winner, winnerSolved] = entries[0];
-      let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
-      text += `🏆 *Group Winner: ${winner}* with *${winnerSolved}* solved!\n\n📊 *Group Performance:*\n`;
-      entries.forEach(([h, s], i) => {
-        const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-        text += `${medal} *${h}* — ${s} solved\n`;
-      });
-      const notParticipated = handles.filter((h) => !solvedMap[h]);
-      if (notParticipated.length) text += `\n😴 Didn't participate: ${notParticipated.join(", ")}`;
-      await sock.sendMessage(chatId, { text });
-      await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
-    } catch (e) {
-      console.error(`Winner check error for ${chatId}:`, e.message);
-    }
-  }
-}
-
-// ─── Express Server ───────────────────────────────────────────────────────────
+// ─── Express ──────────────────────────────────────────────────────────────────
 const app = express();
 app.get("/", (req, res) => res.send("✅ CF WhatsApp Bot is running!"));
 app.get("/ping", (req, res) => res.send("🏓 Pong!"));
 app.get("/qr", async (req, res) => {
-  if (!latestQR) {
-    return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Bot is already connected!</h2><p>No QR needed. Bot is live.</p></body></html>`);
-  }
+  if (!latestQR)
+    return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#0a0a0a;color:#fff"><h2>✅ Bot is connected!</h2></body></html>`);
   try {
-    const qrImageUrl = await QRCode.toDataURL(latestQR);
-    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#0a0a0a;color:#fff"><h2>📱 Scan with WhatsApp</h2><p style="color:#aaa">Open WhatsApp → Linked Devices → Link a Device</p><img src="${qrImageUrl}" style="width:280px;height:280px;border:8px solid #fff;border-radius:12px"/><p style="color:#aaa;font-size:13px">Auto-refreshes every 20s</p><script>setTimeout(()=>location.reload(),20000)</script></body></html>`);
+    const qrImg = await QRCode.toDataURL(latestQR);
+    res.send(`<html><head><meta http-equiv="refresh" content="20"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+    <body style="background:#0a0a0a;color:#fff;font-family:sans-serif;text-align:center;padding:40px">
+    <h2 style="color:#0f0">📱 Scan with WhatsApp</h2>
+    <img src="${qrImg}" style="width:280px;height:280px;border:8px solid #fff;border-radius:12px"/>
+    <p style="color:#aaa">WhatsApp → Linked Devices → Link a Device</p>
+    <p style="color:#555;font-size:12px">Auto-refreshes every 20s</p></body></html>`);
   } catch (e) { res.status(500).send("QR Error: " + e.message); }
 });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Express server on port ${PORT}`));
 
-// ─── Main Bot ─────────────────────────────────────────────────────────────────
+// ─── Bot ──────────────────────────────────────────────────────────────────────
 async function startBot() {
   const { state, saveCreds } = await useMongoAuthState();
   const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version, auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: "silent" }),
-  });
+  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -421,37 +385,30 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       latestQR = qr;
-      console.log("\n📱 QR ready! Open your Render URL + /qr to scan.\n");
       qrcode.generate(qr, { small: true });
+      console.log("📱 QR ready! Visit /qr on your Render URL.");
     }
     if (connection === "close") {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("❌ Connection closed. Reconnecting:", shouldReconnect);
       if (shouldReconnect) setTimeout(startBot, 3000);
-      else console.log("Logged out. Delete AuthState from MongoDB and restart.");
+      else console.log("Logged out. Clear AuthState from MongoDB.");
     }
     if (connection === "open") {
       latestQR = null;
-      console.log("\n✅ CF WhatsApp Bot is ready!");
+      console.log("✅ CF Bot is ready!");
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
     }
   });
 
-  // ─── Message Handler ──────────────────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-
     for (const msg of messages) {
-      if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
-
+      if (!msg.message || msg.key.fromMe) continue;
       const chatId = msg.key.remoteJid;
       if (!chatId?.endsWith("@g.us")) continue;
-
       const body = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim();
       if (!body.startsWith("//")) continue;
-
       const senderId = msg.key.participant || msg.key.remoteJid;
       const command = body.toLowerCase();
       const reply = (text) => sock.sendMessage(chatId, { text }, { quoted: msg });
@@ -460,21 +417,29 @@ async function startBot() {
 
       try {
 
-        // ── // add ────────────────────────────────────────────────────────────
+        // ── // add h1 h2 h3 ───────────────────────────────────────────────────
         if (command.startsWith("// add ")) {
-          const handle = body.slice(7).trim().split(/\s+/)[0];
-          if (!handle) { await reply("❌ Usage: `// add <cf_handle>`\nExample: `// add tourist`"); continue; }
-          await reply(`🔍 Verifying *${handle}*...`);
-          const userInfo = await getCFUser(handle);
-          if (!userInfo) { await reply(`❌ *${handle}* not found on Codeforces. Check spelling.`); continue; }
+          const args = body.slice(7).trim().split(/\s+/).filter(Boolean);
+          if (!args.length) { await reply("❌ Usage: `// add <cf_handle>`\nOr multiple: `// add h1 h2 h3`"); continue; }
+          await reply(`🔍 Verifying ${args.length} handle(s)...`);
           if (!groupData.members[senderId]) groupData.members[senderId] = [];
-          if (groupData.members[senderId].includes(userInfo.handle)) { await reply(`ℹ️ *${userInfo.handle}* is already registered by you.`); continue; }
-          groupData.members[senderId].push(userInfo.handle);
+          const results = [];
+          let added = 0, failed = 0;
+          for (const h of args) {
+            await sleep(300);
+            const userInfo = await getCFUser(h);
+            if (!userInfo) { results.push(`❌ *${h}* — not found`); failed++; continue; }
+            if (groupData.members[senderId].includes(userInfo.handle)) {
+              results.push(`ℹ️ *${userInfo.handle}* — already added`); continue;
+            }
+            groupData.members[senderId].push(userInfo.handle);
+            results.push(`✅ ${rankEmoji(userInfo.rank)} *${userInfo.handle}* — ${userInfo.rating ?? "Unrated"} (${userInfo.rank})`);
+            added++;
+          }
           await saveGroupData(chatId, groupData);
-          await reply(
-            `✅ *${userInfo.handle}* registered!\n\n` +
-            `${rankEmoji(userInfo.rank)} Rating: *${userInfo.rating ?? "Unrated"}* | Rank: ${userInfo.rank}`
-          );
+          let text = `*Registration Results:*\n\n` + results.join("\n");
+          if (args.length > 1) text += `\n\n👥 ${added} added${failed ? `, ${failed} failed` : ""}`;
+          await reply(text);
         }
 
         // ── // remove ─────────────────────────────────────────────────────────
@@ -521,156 +486,130 @@ async function startBot() {
           const users = await getCFUsers(myHandles);
           if (!users.length) { await reply("❌ Failed to fetch. Try again."); continue; }
           let text = `👤 *Your CF Profiles:*\n\n`;
-          for (const u of users) {
-            text += `${rankEmoji(u.rank)} *${u.handle}*\n`;
-            text += `   📊 Rating: *${u.rating ?? "Unrated"}*\n`;
-            text += `   🏅 Rank: ${u.rank}\n`;
-            text += `   🚀 Max: ${u.maxRating ?? "N/A"} (${u.maxRank})\n\n`;
-          }
+          for (const u of users)
+            text += `${rankEmoji(u.rank)} *${u.handle}*\n   📊 Rating: *${u.rating ?? "Unrated"}*\n   🏅 Rank: ${u.rank}\n   🚀 Max: ${u.maxRating ?? "N/A"} (${u.maxRank})\n\n`;
           await reply(text.trim());
         }
 
         // ── // upcoming ───────────────────────────────────────────────────────
         else if (command === "// upcoming") {
-          await reply("⏳ Fetching upcoming contests from all platforms...");
-          const [cfContests, lcContests] = await Promise.all([
-            getCFUpcoming(),
-            getLeetCodeUpcoming(),
-          ]);
-
+          await reply("⏳ Fetching upcoming contests...");
+          const [cfContests, lcContests] = await Promise.all([getCFUpcoming(), getLeetCodeUpcoming()]);
           let text = `📅 *Upcoming Contests*\n${"─".repeat(28)}\n\n`;
-
           if (cfContests.length) {
             text += `🔵 *Codeforces*\n`;
             cfContests.forEach((c) => {
-              text += `  • *${c.name}*\n`;
-              text += `    🕐 ${formatStartTime(c.startTimeSeconds)}\n`;
-              text += `    ⏱ ${formatDuration(c.durationSeconds)}\n\n`;
+              text += `  • *${c.name}*\n    🕐 ${formatIST(c.startTimeSeconds)}\n    ⏱ ${formatDuration(c.durationSeconds)}\n\n`;
             });
           }
-
           if (lcContests.length) {
             text += `🟡 *LeetCode*\n`;
             lcContests.forEach((c) => {
-              text += `  • *${c.title}*\n`;
-              text += `    🕐 ${formatStartTime(c.startTime)}\n`;
-              text += `    ⏱ ${formatDuration(c.duration)}\n\n`;
+              text += `  • *${c.title}*\n    🕐 ${formatIST(c.startTime)}\n    ⏱ ${formatDuration(c.duration)}\n\n`;
             });
           }
-
-          if (!cfContests.length && !lcContests.length) {
-            text += `😴 No upcoming contests found right now.`;
-          }
-
-          text += `_Note: AtCoder & CodeChef times are on their official sites_`;
+          if (!cfContests.length && !lcContests.length) text += `😴 No upcoming contests right now.`;
           await reply(text.trim());
         }
 
-        // ── // solved ─────────────────────────────────────────────────────────
-        else if (command.startsWith("// solved")) {
+        // ── // solved (auto-detect only) ──────────────────────────────────────
+        else if (command === "// solved") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
 
-          const arg = body.slice(9).trim();
-          let contestId = null;
-          let contestName = "";
+          await reply("🔍 Detecting current/recent contest...");
 
-          if (arg) {
-            contestId = parseInt(arg);
-            if (isNaN(contestId)) { await reply("❌ Invalid contest ID. Use a number like: `// solved 2060`"); continue; }
-            contestName = `Contest #${contestId}`;
-          } else {
-            await reply("🔍 Looking for active/recent contest...");
-            const running = await getRunningContest();
-            if (running) {
-              contestId = running.id;
-              contestName = running.name;
-            } else {
-              const finished = await getRecentFinishedContests(3);
-              if (finished.length) { contestId = finished[0].id; contestName = finished[0].name; }
-            }
-            if (!contestId) { await reply("❌ No active or recent contest found.\nTry: `// solved <contest_id>`"); continue; }
-          }
+          // Try running contest first, then most recent finished
+          let contest = await getRunningContest();
+          let isLive = !!contest;
+          if (!contest) contest = await getRecentFinishedContest();
+          if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
 
-          await reply(`⏳ Fetching standings for *${contestName}*...\n_This may take 10-20 seconds_`);
-          const [problems, solvedMap] = await Promise.all([
-            getContestProblems(contestId),
-            getContestStandings(contestId, handles),
+          await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
+
+          const [{ problems }, solvedMap] = await Promise.all([
+            getContestDetails(contest.id),
+            getContestStandings(contest.id, handles),
           ]);
 
-          if (!solvedMap) { await reply("❌ Failed to fetch standings. Contest may be too old or CF API is down."); continue; }
+          if (!solvedMap) { await reply("❌ Failed to fetch standings. CF API may be down. Try again."); continue; }
 
           const totalProblems = problems.length;
-          const participated = Object.entries(solvedMap).filter(([, s]) => s > 0);
-          participated.sort((a, b) => b[1] - a[1]);
+          const problemLetters = problems.map((p) => p.index).join(" ");
+          const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+          const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
 
-          let text = `📊 *${contestName}*\n`;
-          if (totalProblems) text += `📝 Total Problems: ${totalProblems}\n`;
+          let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
+          text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
+          text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
+          if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
 
           if (!participated.length) {
-            text += `😴 No group members participated yet.`;
+            text += `😴 No group members have participated yet.`;
           } else {
             participated.forEach(([h, s], i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              const bar = "█".repeat(s) + "░".repeat(Math.max(0, totalProblems - s));
-              text += `${medal} *${h}*\n   ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} ${totalProblems ? bar : ""}\n\n`;
+              text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
             });
-            const notSolved = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
-            if (notSolved.length) text += `😴 Not participated: ${notSolved.join(", ")}`;
+            if (notParticipated.length) text += `\n😴 Not participated: ${notParticipated.join(", ")}`;
           }
           await reply(text.trim());
         }
 
-        // ── // streak ─────────────────────────────────────────────────────────
-        else if (command === "// streak") {
-          const handles = getAllHandles(groupData);
-          if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          await reply(`⏳ Fetching streaks for ${handles.length} member(s)... _May take a while_`);
+        // ── // streak <cf_id> ─────────────────────────────────────────────────
+        else if (command.startsWith("// streak")) {
+          const arg = body.slice(9).trim();
+          if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
+          await reply(`⏳ Fetching streak for *${arg}*... _May take 10-15 seconds_`);
+          const streak = await getCFStreak(arg);
+          if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          const results = await Promise.all(handles.map(async (h) => {
-            const streak = await getCFStreak(h);
-            return { handle: h, streak };
-          }));
+          const today = new Date().toISOString().slice(0, 10);
+          const lastSolved = streak.lastSolvedDate;
+          const lastSolvedText = lastSolved === today ? "Today ✅" :
+            lastSolved === new Date(Date.now() - 86400000).toISOString().slice(0, 10) ? "Yesterday" :
+            lastSolved ?? "Never";
 
-          results.sort((a, b) => (b.streak?.max ?? 0) - (a.streak?.max ?? 0));
+          let text = `🔥 *Streak Report: ${arg}*\n${"─".repeat(28)}\n\n`;
+          text += `📅 Current Streak: *${streak.current} days* ${streakFire(streak.current)}\n`;
+          text += `🏆 Max Streak Ever: *${streak.max} days*\n`;
+          text += `✅ Last Solved: *${lastSolvedText}*\n\n`;
+          text += `🔥 Scale:\n`;
+          text += `   1-7 days → 🔥\n`;
+          text += `   8-14 days → 🔥🔥\n`;
+          text += `   15-30 days → 🔥🔥🔥\n`;
+          text += `   30+ days → 🔥🔥🔥🔥`;
 
-          let text = `🔥 *CF Streaks*\n${"─".repeat(28)}\n\n`;
-          results.forEach((r, i) => {
-            const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-            if (!r.streak) {
-              text += `${medal} *${r.handle}* — ❌ fetch failed\n`;
-            } else {
-              text += `${medal} *${r.handle}*\n`;
-              text += `   🔥 Current streak: *${r.streak.current}* days\n`;
-              text += `   🏆 Max streak: *${r.streak.max}* days\n\n`;
-            }
-          });
-          await reply(text.trim());
+          if (streak.current === 0)
+            text += `\n\n💪 No active streak. Start solving to build one!`;
+
+          await reply(text);
         }
 
-
-        // ── // info <handle> ──────────────────────────────────────────────────
+        // ── // info <cf_id> ───────────────────────────────────────────────────
         else if (command.startsWith("// info")) {
           const arg = body.slice(7).trim();
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
           await reply(`⏳ Fetching info for *${arg}*... _May take 10-15 seconds_`);
           const info = await getCFUserInfo(arg);
-          if (!info) { await reply(`❌ Could not fetch *${arg}*. Check if handle is correct.`); continue; }
+          if (!info) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          // Build rating distribution
           const buckets = info.ratingBuckets;
           const ranges = [
-            [800, 1000], [1000, 1200], [1200, 1400], [1400, 1600],
-            [1600, 1800], [1800, 2000], [2000, 2200], [2200, 2400],
-            [2400, 2600], [2600, 3500],
+            [800, 900], [900, 1000], [1000, 1100], [1100, 1200],
+            [1200, 1300], [1300, 1400], [1400, 1500], [1500, 1600],
+            [1600, 1700], [1700, 1800], [1800, 1900], [1900, 2000],
+            [2000, 2100], [2100, 2200], [2200, 2400], [2400, 2600],
+            [2600, 9999],
           ];
 
           let text = `👤 *${info.handle}*\n${"─".repeat(28)}\n\n`;
           text += `${rankEmoji(info.rank)} Rank: *${info.rank}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
-          text += `✅ Total Solved: *${info.totalSolved}* problems\n\n`;
+          text += `✅ Total Solved: *${info.totalSolved}* problems\n`;
+          text += `🏁 Contests: *${info.contests}*\n\n`;
           text += `📈 *Problems by Rating:*\n`;
 
           for (const [lo, hi] of ranges) {
@@ -678,8 +617,8 @@ async function startBot() {
               .filter(([r]) => parseInt(r) >= lo && parseInt(r) < hi)
               .reduce((sum, [, c]) => sum + c, 0);
             if (count > 0) {
-              const bar = "█".repeat(Math.min(count, 15));
-              text += `  ${lo}-${hi === 3500 ? "2600+" : hi}: ${bar} *${count}*\n`;
+              const label = hi === 9999 ? "2600+" : `${lo}`;
+              text += `  ${label} → ${count} ${solvedEmoji(count)}\n`;
             }
           }
 
@@ -690,16 +629,16 @@ async function startBot() {
         else if (command === "// help") {
           await reply(
             `🤖 *CF Group Bot — Commands*\n\n` +
-            `➕ \`// add <cf_id>\`\n    Register your CF username\n    Example: \`// add tourist\`\n\n` +
+            `➕ \`// add <cf_id>\`\n    Register your CF handle\n\n` +
+            `➕ \`// add h1 h2 h3\`\n    Add multiple handles at once\n\n` +
             `❌ \`// remove\`\n    Remove all your handles\n\n` +
             `❌ \`// remove <cf_id>\`\n    Remove one specific handle\n\n` +
-            `🏆 \`// rating\`\n    Group leaderboard sorted by rating\n\n` +
+            `🏆 \`// rating\`\n    Group leaderboard by rating\n\n` +
             `👤 \`// myrating\`\n    Your own CF rating & rank\n\n` +
-            `📅 \`// upcoming\`\n    Upcoming CF + LeetCode contests (IST)\n\n` +
-            `📊 \`// solved\`\n    Who solved what in current/recent contest\n\n` +
-            `📊 \`// solved <contest_id>\`\n    Solved stats for a specific contest\n    Example: \`// solved 2060\`\n\n` +
-            `🔥 \`// streak\`\n    Current & max streak of all group members\n\n` +
-            `👤 \`// info <cf_id>\`\n    Full profile: rating, total solved & rating-wise breakdown\n    Example: \`// info tourist\`\n\n` +
+            `📅 \`// upcoming\`\n    Upcoming CF + LeetCode contests\n\n` +
+            `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
+            `🔥 \`// streak <cf_id>\`\n    Streak report for any CF user\n    Example: \`// streak tourist\`\n\n` +
+            `👤 \`// info <cf_id>\`\n    Full profile: rating, solved, breakdown\n    Example: \`// info tourist\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every contest!*`
           );
