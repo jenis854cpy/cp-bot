@@ -114,139 +114,45 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
-// ─── Streak (scrapes CF profile page) ────────────────────────────────────────
+// ─── Streak (brute force 10000 submissions — accurate) ───────────────────────
 async function getCFStreak(handle) {
-  try {
-    const res = await axios.get(`https://codeforces.com/profile/${handle}`, {
-      timeout: 12000,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-      },
-    });
-    const html = res.data;
-
-    let current = 0, max = 0;
-
-    // CF profile page stores streak in _UserActivityFrame_ section
-    // Pattern: two numbers appear close together near "streak" text
-    // Example HTML: <span class="...">125</span> day streak / max: <span>200</span>
-
-    // Most reliable: look for the _UserActivityFrame_ iframe src which contains streak data
-    const iframeSrc = html.match(/src="([^"]*_UserActivityFrame_[^"]*)"/i)?.[1];
-    if (iframeSrc) {
-      const frameUrl = iframeSrc.startsWith("http") ? iframeSrc : `https://codeforces.com${iframeSrc}`;
-      const frameRes = await axios.get(frameUrl, {
-        timeout: 10000,
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
-      });
-      const frameHtml = frameRes.data;
-
-      // Extract streak numbers from iframe
-      // CF shows: "X day streak" and "max streak: Y"
-      const streakNums = [...frameHtml.matchAll(/>\s*(\d+)\s*</g)].map(m => parseInt(m[1])).filter(n => n > 0);
-      const curMatch = frameHtml.match(/currentStreak[^>]*>\s*(\d+)/i) ||
-                       frameHtml.match(/(\d+)\s*<[^>]*>\s*day/i) ||
-                       frameHtml.match(/streak[^\d]*(\d+)/i);
-      const maxMatch = frameHtml.match(/maxStreak[^>]*>\s*(\d+)/i) ||
-                       frameHtml.match(/max[^\d]*(\d+)/i);
-
-      if (curMatch) current = parseInt(curMatch[1]);
-      if (maxMatch) max = parseInt(maxMatch[1]);
-
-      // If still 0, try grabbing all numbers near "streak"
-      if (!current) {
-        const section = frameHtml.match(/streak[\s\S]{0,300}/i)?.[0] || "";
-        const nums = [...section.matchAll(/(\d+)/g)].map(m => parseInt(m[1])).filter(n => n > 0 && n < 9999);
-        if (nums.length >= 2) { current = nums[0]; max = Math.max(nums[0], nums[1]); }
-        else if (nums.length === 1) { current = nums[0]; max = nums[0]; }
-      }
-    }
-
-    // Fallback: try directly from main profile HTML
-    if (!current && !max) {
-      // CF sometimes embeds it directly
-      const curMatch = html.match(/currentStreak[^>]*>\s*(\d+)/i) ||
-                       html.match(/(\d+)\s*day streak/i);
-      const maxMatch = html.match(/maxStreak[^>]*>\s*(\d+)/i) ||
-                       html.match(/max\s*streak[^\d]*(\d+)/i);
-      if (curMatch) current = parseInt(curMatch[1]);
-      if (maxMatch) max = parseInt(maxMatch[1]);
-    }
-
-    // Final fallback: use CF API submissions to calculate streak
-    if (!current && !max) {
-      const subRes = await axios.get(
-        `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=500`,
-        { timeout: 12000 }
-      );
-      const subs = subRes.data.result || [];
-      const acDays = new Set();
-      for (const s of subs) {
-        if (s.verdict === "OK") {
-          acDays.add(new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10));
-        }
-      }
-      const sorted = [...acDays].sort().reverse();
-      if (sorted.length) {
-        // Current streak
-        let streak = 0;
-        let checkDate = new Date();
-        for (let i = 0; i < 400; i++) {
-          const d = checkDate.toISOString().slice(0, 10);
-          if (acDays.has(d)) { streak++; checkDate = new Date(checkDate - 86400000); }
-          else if (i === 0) { checkDate = new Date(checkDate - 86400000); } // allow today to not be solved yet
-          else break;
-        }
-        current = streak;
-        // Max streak from last 500 subs (approximate)
-        const sortedAsc = [...acDays].sort();
-        let maxS = 1, curS = 1;
-        for (let i = 1; i < sortedAsc.length; i++) {
-          const diff = (new Date(sortedAsc[i]) - new Date(sortedAsc[i-1])) / 86400000;
-          if (diff === 1) { curS++; maxS = Math.max(maxS, curS); }
-          else curS = 1;
-        }
-        max = maxS;
-      }
-    }
-
-    return { current, max };
-  } catch (e) {
-    console.error("getCFStreak error:", e.message);
-    return null;
-  }
-}
-
-// ─── CF User Info Q (problems solved by rating bucket) ───────────────────────
-async function getCFUserInfoQ(handle) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
       { timeout: 20000 }
     );
     const subs = res.data.result || [];
-    const solved = new Set();
-    const buckets = { "800-1199": 0, "1200-1599": 0, "1600-1999": 0, "2000+": 0 };
-
+    const acDays = new Set();
     for (const s of subs) {
-      if (s.verdict === "OK" && s.problem) {
-        const key = `${s.problem.contestId}-${s.problem.index}`;
-        if (!solved.has(key)) {
-          solved.add(key);
-          const r = s.problem.rating;
-          if (r) {
-            if (r >= 800 && r <= 1199) buckets["800-1199"]++;
-            else if (r >= 1200 && r <= 1599) buckets["1200-1599"]++;
-            else if (r >= 1600 && r <= 1999) buckets["1600-1999"]++;
-            else if (r >= 2000) buckets["2000+"]++;
-          }
-        }
-      }
+      if (s.verdict === "OK")
+        acDays.add(new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10));
     }
-    return { total: solved.size, buckets };
-  } catch { return null; }
+    const sortedAsc = [...acDays].sort();
+
+    // Max streak
+    let maxS = sortedAsc.length ? 1 : 0, curS = 1;
+    for (let i = 1; i < sortedAsc.length; i++) {
+      const diff = (new Date(sortedAsc[i]) - new Date(sortedAsc[i - 1])) / 86400000;
+      if (diff === 1) { curS++; maxS = Math.max(maxS, curS); }
+      else curS = 1;
+    }
+
+    // Current streak (count backwards from today)
+    let current = 0;
+    let checkDate = new Date();
+    checkDate.setUTCHours(0, 0, 0, 0);
+    for (let i = 0; i < 1000; i++) {
+      const d = checkDate.toISOString().slice(0, 10);
+      if (acDays.has(d)) { current++; checkDate = new Date(checkDate - 86400000); }
+      else if (i === 0) { checkDate = new Date(checkDate - 86400000); }
+      else break;
+    }
+
+    return { current, max: maxS };
+  } catch (e) {
+    console.error("getCFStreak error:", e.message);
+    return null;
+  }
 }
 
 // ─── CF User Info (scrapes profile page — fast, accurate) ─────────────────────
@@ -677,28 +583,21 @@ async function startBot() {
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
           if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
-          await reply(`⏳ Fetching streak for *${arg}*...`);
+          await reply(`⏳ Fetching streak for *${arg}*... _May take 10-15 seconds_`);
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          const curFire = streakFire(streak.current);
-          const maxFire = streakFire(streak.max);
+          let text = `🔥 *Streak Report: ${streak.handle || arg}*\n${"─".repeat(28)}\n\n`;
+          text += `📅 Current Streak: *${streak.current} days* ${streakFire(streak.current)}\n`;
+          text += `🏆 Max Streak Ever: *${streak.max} days*\n\n`;
+          text += `🔥 Scale:\n`;
+          text += `   1-7 days → 🔥\n`;
+          text += `   8-14 days → 🔥🔥\n`;
+          text += `   15-30 days → 🔥🔥🔥\n`;
+          text += `   30+ days → 🔥🔥🔥🔥`;
 
-          let text = `🔥 *Streak — ${arg}*\n${"─".repeat(28)}\n\n`;
-          text += `${curFire} Current Streak: *${streak.current} days*\n`;
-          text += `🏆 Max Streak Ever: *${streak.max} days* ${maxFire}\n`;
-
-          if (streak.current === 0) {
-            text += `\n💤 No active streak right now.\n💪 Solve a problem today to start one!`;
-          } else if (streak.current >= 30) {
-            text += `\n🚀 Incredible! Keep it going!`;
-          } else if (streak.current >= 15) {
-            text += `\n💪 Great streak! Don't break it!`;
-          } else if (streak.current >= 7) {
-            text += `\n⭐ Nice! One week+ streak!`;
-          } else {
-            text += `\n📈 Good start! Keep solving daily!`;
-          }
+          if (streak.current === 0)
+            text += `\n\n💪 No active streak. Start solving to build one!`;
 
           await reply(text);
         }
@@ -707,43 +606,30 @@ async function startBot() {
         else if (command.startsWith("// info")) {
           const arg = body.slice(7).trim();
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
-          await reply(`⏳ Fetching info for *${arg}*... _May take 10-15 seconds_`);
-          const info = await getCFUserInfo(arg);
+          await reply(`⏳ Fetching info for *${arg}*...\n_May take 15-20 seconds_`);
+          const [info, qData] = await Promise.all([
+            getCFUserInfo(arg),
+            getCFUserInfoQ(arg),
+          ]);
           if (!info) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
           let text = `👤 *${info.handle}*\n${"─".repeat(28)}\n\n`;
           text += `${rankEmoji(info.rank)} Rank: *${info.rank}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
-          text += `✅ Total Solved: *${info.totalSolved || "N/A"}* problems\n`;
-          text += `🏁 Contests: *${info.contests}*`;
+          text += `🏁 Contests: *${info.contests}*\n\n`;
 
-          await reply(text.trim());
-        }
-
-        // ── // info q <cf_id> ────────────────────────────────────────────────
-        else if (command.startsWith("// info q")) {
-          const arg = body.slice(9).trim();
-          if (!arg) { await reply("❌ Usage: `// info q <cf_handle>`\nExample: `// info q tourist`"); continue; }
-          await reply(`⏳ Fetching problem stats for *${arg}*...\n_This may take 15-20 seconds_`);
-          const data = await getCFUserInfoQ(arg);
-          if (!data) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
-
-          const b = data.buckets;
-          const maxCount = Math.max(...Object.values(b), 1);
-
-          function bar(count) {
-            const filled = Math.round((count / maxCount) * 12);
-            return "█".repeat(filled) + "░".repeat(12 - filled);
+          if (qData) {
+            const b = qData.buckets;
+            const maxCount = Math.max(...Object.values(b), 1);
+            const bar = (n) => "█".repeat(Math.round((n / maxCount) * 12)) + "░".repeat(12 - Math.round((n / maxCount) * 12));
+            text += `✅ Total Solved: *${qData.total}*\n\n`;
+            text += `📈 *By Rating:*\n`;
+            text += `  🟢 800–1199  : ${bar(b["800-1199"])} *${b["800-1199"]}*\n`;
+            text += `  🔵 1200–1599 : ${bar(b["1200-1599"])} *${b["1200-1599"]}*\n`;
+            text += `  🟡 1600–1999 : ${bar(b["1600-1999"])} *${b["1600-1999"]}*\n`;
+            text += `  🔴 2000+     : ${bar(b["2000+"])} *${b["2000+"]}*\n`;
           }
-
-          let text = `📊 *Problems by Rating — ${arg}*\n${"─".repeat(28)}\n\n`;
-          text += `✅ Total Unique Solved: *${data.total}*\n\n`;
-          text += `📈 *Rating Breakdown:*\n`;
-          text += `  🟢 800–1199  : ${bar(b["800-1199"])} *${b["800-1199"]}*\n`;
-          text += `  🔵 1200–1599 : ${bar(b["1200-1599"])} *${b["1200-1599"]}*\n`;
-          text += `  🟡 1600–1999 : ${bar(b["1600-1999"])} *${b["1600-1999"]}*\n`;
-          text += `  🔴 2000+     : ${bar(b["2000+"])} *${b["2000+"]}*\n`;
 
           await reply(text.trim());
         }
@@ -761,8 +647,7 @@ async function startBot() {
             `📅 \`// upcoming\`\n    Upcoming CF + LeetCode contests\n\n` +
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
-            `👤 \`// info <cf_id>\`\n    Full profile: rating, total solved, contests\n    Example: \`// info tourist\`\n\n` +
-            `📊 \`// info q <cf_id>\`\n    Problems solved by rating bucket\n    Example: \`// info q tourist\`\n\n` +
+            `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every contest!*`
           );
