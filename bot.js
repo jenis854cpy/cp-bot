@@ -114,71 +114,102 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
-// ─── Streak ───────────────────────────────────────────────────────────────────
+// ─── Streak (scrapes CF profile page — fast, no submissions needed) ───────────
 async function getCFStreak(handle) {
   try {
-    const res = await axios.get(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`, { timeout: 15000 });
-    const subs = res.data.result;
-    const acDays = new Set();
-    for (const s of subs)
-      if (s.verdict === "OK")
-        acDays.add(new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10));
+    const res = await axios.get(`https://codeforces.com/profile/${handle}`, {
+      timeout: 10000,
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
+    });
+    const html = res.data;
 
-    const sortedDays = [...acDays].sort();
-    if (!sortedDays.length) return { current: 0, max: 0, lastSolvedDate: null };
+    // Extract current streak — CF profile shows it as a number near "day" text
+    let current = 0, max = 0;
 
-    let maxStreak = 1, cur = 1;
-    for (let i = 1; i < sortedDays.length; i++) {
-      const diff = (new Date(sortedDays[i]) - new Date(sortedDays[i - 1])) / 86400000;
-      if (diff === 1) { cur++; maxStreak = Math.max(maxStreak, cur); }
-      else cur = 1;
+    // Try multiple patterns CF uses
+    const currentPatterns = [
+      /class="[^"]*currentStreak[^"]*"[^>]*>(\d+)/i,
+      /(\d+)\s*<\/span>\s*day streak/i,
+      /"streak"[^>]*>(\d+)/i,
+      /Current streak[^<]*<[^>]+>(\d+)/i,
+      /(\d+)<\/span>\s*days?\s*streak/i,
+    ];
+
+    const maxPatterns = [
+      /class="[^"]*maxStreak[^"]*"[^>]*>(\d+)/i,
+      /Max streak[^<]*<[^>]+>(\d+)/i,
+      /longest streak[^<]*<[^>]+>(\d+)/i,
+      /(\d+)<\/span>\s*days?\s*\(max\)/i,
+    ];
+
+    for (const p of currentPatterns) {
+      const m = html.match(p);
+      if (m) { current = parseInt(m[1]); break; }
     }
 
-    const today = new Date().toISOString().slice(0, 10);
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    let currentStreak = 0;
-    if (acDays.has(today) || acDays.has(yesterday)) {
-      let checkDay = acDays.has(today) ? new Date(today) : new Date(yesterday);
-      while (true) {
-        const dayStr = checkDay.toISOString().slice(0, 10);
-        if (acDays.has(dayStr)) { currentStreak++; checkDay = new Date(checkDay - 86400000); }
-        else break;
-      }
+    for (const p of maxPatterns) {
+      const m = html.match(p);
+      if (m) { max = parseInt(m[1]); break; }
     }
 
-    const lastSolvedDate = sortedDays[sortedDays.length - 1];
-    return { current: currentStreak, max: maxStreak, lastSolvedDate };
+    // Fallback: find all streak-related numbers in the page
+    if (!current && !max) {
+      const streakSection = html.match(/streak[\s\S]{0,500}/i)?.[0] || "";
+      const nums = streakSection.match(/\d+/g) || [];
+      if (nums.length >= 2) { current = parseInt(nums[0]); max = parseInt(nums[1]); }
+      else if (nums.length === 1) { current = parseInt(nums[0]); max = current; }
+    }
+
+    return { current, max, lastSolvedDate: null };
   } catch { return null; }
 }
 
-// ─── CF User Info ─────────────────────────────────────────────────────────────
+// ─── CF User Info (scrapes profile page — fast, accurate) ─────────────────────
 async function getCFUserInfo(handle) {
   try {
-    const [userRes, subRes, ratingRes] = await Promise.all([
+    const [userRes, ratingRes, profileRes] = await Promise.all([
       axios.get(`https://codeforces.com/api/user.info?handles=${handle}`, { timeout: 8000 }),
-      axios.get(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`, { timeout: 15000 }),
       axios.get(`https://codeforces.com/api/user.rating?handle=${handle}`, { timeout: 8000 }),
+      axios.get(`https://codeforces.com/profile/${handle}`, {
+        timeout: 10000,
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
+      }),
     ]);
-    const u = userRes.data.result[0];
-    const subs = subRes.data.result;
-    const contests = ratingRes.data.result?.length ?? 0;
 
-    const solved = new Set();
-    const ratingBuckets = {};
-    for (const s of subs) {
-      if (s.verdict === "OK" && s.problem) {
-        const key = `${s.problem.contestId}-${s.problem.index}`;
-        if (!solved.has(key)) {
-          solved.add(key);
-          const r = s.problem.rating;
-          if (r) ratingBuckets[r] = (ratingBuckets[r] || 0) + 1;
-        }
-      }
+    const u = userRes.data.result[0];
+    const contests = ratingRes.data.result?.length ?? 0;
+    const html = profileRes.data;
+
+    // Extract total solved from profile page
+    let totalSolved = 0;
+    const solvedPatterns = [
+      /(\d+)\s*problems?\s*solved/i,
+      /solved\s*:\s*(\d+)/i,
+      /"problemsSolved"[^>]*>(\d+)/i,
+      /Problems solved[^<]*<[^>]+>(\d+)/i,
+      /_UserActivityFrame_[^>]*>[\s\S]*?(\d+)\s*problems/i,
+    ];
+    for (const p of solvedPatterns) {
+      const m = html.match(p);
+      if (m) { totalSolved = parseInt(m[1]); break; }
     }
+
+    // Fallback: look for number near "solved" text
+    if (!totalSolved) {
+      const section = html.match(/solved[\s\S]{0,200}/i)?.[0] || "";
+      const num = section.match(/(\d+)/)?.[1];
+      if (num) totalSolved = parseInt(num);
+    }
+
     return {
-      handle: u.handle, rating: u.rating ?? null, maxRating: u.maxRating ?? null,
-      rank: u.rank ?? "newbie", maxRank: u.maxRank ?? "newbie",
-      totalSolved: solved.size, ratingBuckets, contests,
+      handle: u.handle,
+      rating: u.rating ?? null,
+      maxRating: u.maxRating ?? null,
+      rank: u.rank ?? "newbie",
+      maxRank: u.maxRank ?? "newbie",
+      totalSolved,
+      ratingBuckets: {}, // removed brute force — no bucket breakdown
+      contests,
     };
   } catch { return null; }
 }
@@ -565,16 +596,9 @@ async function startBot() {
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          const today = new Date().toISOString().slice(0, 10);
-          const lastSolved = streak.lastSolvedDate;
-          const lastSolvedText = lastSolved === today ? "Today ✅" :
-            lastSolved === new Date(Date.now() - 86400000).toISOString().slice(0, 10) ? "Yesterday" :
-            lastSolved ?? "Never";
-
-          let text = `🔥 *Streak Report: ${arg}*\n${"─".repeat(28)}\n\n`;
+          let text = `🔥 *Streak Report: ${streak.handle || arg}*\n${"─".repeat(28)}\n\n`;
           text += `📅 Current Streak: *${streak.current} days* ${streakFire(streak.current)}\n`;
-          text += `🏆 Max Streak Ever: *${streak.max} days*\n`;
-          text += `✅ Last Solved: *${lastSolvedText}*\n\n`;
+          text += `🏆 Max Streak Ever: *${streak.max} days*\n\n`;
           text += `🔥 Scale:\n`;
           text += `   1-7 days → 🔥\n`;
           text += `   8-14 days → 🔥🔥\n`;
@@ -595,32 +619,12 @@ async function startBot() {
           const info = await getCFUserInfo(arg);
           if (!info) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          const buckets = info.ratingBuckets;
-          const ranges = [
-            [800, 900], [900, 1000], [1000, 1100], [1100, 1200],
-            [1200, 1300], [1300, 1400], [1400, 1500], [1500, 1600],
-            [1600, 1700], [1700, 1800], [1800, 1900], [1900, 2000],
-            [2000, 2100], [2100, 2200], [2200, 2400], [2400, 2600],
-            [2600, 9999],
-          ];
-
           let text = `👤 *${info.handle}*\n${"─".repeat(28)}\n\n`;
           text += `${rankEmoji(info.rank)} Rank: *${info.rank}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
-          text += `✅ Total Solved: *${info.totalSolved}* problems\n`;
-          text += `🏁 Contests: *${info.contests}*\n\n`;
-          text += `📈 *Problems by Rating:*\n`;
-
-          for (const [lo, hi] of ranges) {
-            const count = Object.entries(buckets)
-              .filter(([r]) => parseInt(r) >= lo && parseInt(r) < hi)
-              .reduce((sum, [, c]) => sum + c, 0);
-            if (count > 0) {
-              const label = hi === 9999 ? "2600+" : `${lo}`;
-              text += `  ${label} → ${count} ${solvedEmoji(count)}\n`;
-            }
-          }
+          text += `✅ Total Solved: *${info.totalSolved || "N/A"}* problems\n`;
+          text += `🏁 Contests: *${info.contests}*`;
 
           await reply(text.trim());
         }
