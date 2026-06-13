@@ -155,6 +155,35 @@ async function getCFStreak(handle) {
   }
 }
 
+// ─── CF User Info Q (problems by rating bucket via 10000 submissions) ──────────
+async function getCFUserInfoQ(handle) {
+  try {
+    const res = await axios.get(
+      `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+      { timeout: 20000 }
+    );
+    const subs = res.data.result || [];
+    const solved = new Set();
+    const buckets = { "800-1199": 0, "1200-1599": 0, "1600-1999": 0, "2000+": 0 };
+    for (const s of subs) {
+      if (s.verdict === "OK" && s.problem) {
+        const key = `${s.problem.contestId}-${s.problem.index}`;
+        if (!solved.has(key)) {
+          solved.add(key);
+          const r = s.problem.rating;
+          if (r) {
+            if (r >= 800 && r <= 1199) buckets["800-1199"]++;
+            else if (r >= 1200 && r <= 1599) buckets["1200-1599"]++;
+            else if (r >= 1600 && r <= 1999) buckets["1600-1999"]++;
+            else if (r >= 2000) buckets["2000+"]++;
+          }
+        }
+      }
+    }
+    return { total: solved.size, buckets };
+  } catch { return null; }
+}
+
 // ─── CF User Info (scrapes profile page — fast, accurate) ─────────────────────
 async function getCFUserInfo(handle) {
   try {
@@ -587,17 +616,17 @@ async function startBot() {
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
 
-          let text = `🔥 *Streak Report: ${streak.handle || arg}*\n${"─".repeat(28)}\n\n`;
-          text += `📅 Current Streak: *${streak.current} days* ${streakFire(streak.current)}\n`;
-          text += `🏆 Max Streak Ever: *${streak.max} days*\n\n`;
-          text += `🔥 Scale:\n`;
-          text += `   1-7 days → 🔥\n`;
-          text += `   8-14 days → 🔥🔥\n`;
-          text += `   15-30 days → 🔥🔥🔥\n`;
-          text += `   30+ days → 🔥🔥🔥🔥`;
+          const curFire = streakFire(streak.current);
+          const maxFire = streakFire(streak.max);
+          let text = `🔥 *Streak — ${arg}*\n${"─".repeat(28)}\n\n`;
+          text += `${curFire} Current Streak: *${streak.current} days*\n`;
+          text += `🏆 Max Streak Ever: *${streak.max} days* ${maxFire}\n`;
 
-          if (streak.current === 0)
-            text += `\n\n💪 No active streak. Start solving to build one!`;
+          if (streak.current === 0) text += `\n💤 No active streak.\n💪 Solve a problem today to start one!`;
+          else if (streak.current >= 30) text += `\n🚀 Incredible! Keep it going!`;
+          else if (streak.current >= 15) text += `\n💪 Great streak! Don't break it!`;
+          else if (streak.current >= 7) text += `\n⭐ One week+ streak!`;
+          else text += `\n📈 Good start! Keep solving daily!`;
 
           await reply(text);
         }
