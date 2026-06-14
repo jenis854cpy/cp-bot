@@ -114,7 +114,14 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
-// ─── Streak (brute force 10000 submissions — accurate) ───────────────────────
+// ─── Streak (brute force 10000 submissions — IST day boundaries) ──────────────
+// Converts each submission's UTC timestamp to an IST calendar date (UTC+5:30)
+function toISTDateStr(unixSeconds) {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const d = new Date(unixSeconds * 1000 + IST_OFFSET_MS);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD in IST
+}
+
 async function getCFStreak(handle) {
   try {
     const res = await axios.get(
@@ -125,27 +132,42 @@ async function getCFStreak(handle) {
     const acDays = new Set();
     for (const s of subs) {
       if (s.verdict === "OK")
-        acDays.add(new Date(s.creationTimeSeconds * 1000).toISOString().slice(0, 10));
+        acDays.add(toISTDateStr(s.creationTimeSeconds));
     }
+
+    if (acDays.size === 0) return { current: 0, max: 0 };
+
     const sortedAsc = [...acDays].sort();
 
-    // Max streak
-    let maxS = sortedAsc.length ? 1 : 0, curS = 1;
+    // Max streak — count consecutive calendar days
+    let maxS = 1, curS = 1;
     for (let i = 1; i < sortedAsc.length; i++) {
-      const diff = (new Date(sortedAsc[i]) - new Date(sortedAsc[i - 1])) / 86400000;
-      if (diff === 1) { curS++; maxS = Math.max(maxS, curS); }
-      else curS = 1;
+      const prev = new Date(sortedAsc[i - 1] + "T00:00:00Z");
+      const curr = new Date(sortedAsc[i] + "T00:00:00Z");
+      const diffDays = Math.round((curr - prev) / 86400000);
+      if (diffDays === 1) { curS++; maxS = Math.max(maxS, curS); }
+      else if (diffDays > 1) curS = 1;
+      // diffDays === 0 shouldn't happen since acDays is a Set of unique dates
     }
 
-    // Current streak (count backwards from today)
+    // Current streak — walk backwards from today (IST) or yesterday
+    const nowIST = toISTDateStr(Math.floor(Date.now() / 1000));
     let current = 0;
-    let checkDate = new Date();
-    checkDate.setUTCHours(0, 0, 0, 0);
-    for (let i = 0; i < 1000; i++) {
-      const d = checkDate.toISOString().slice(0, 10);
-      if (acDays.has(d)) { current++; checkDate = new Date(checkDate - 86400000); }
-      else if (i === 0) { checkDate = new Date(checkDate - 86400000); }
-      else break;
+    let cursor = new Date(nowIST + "T00:00:00Z");
+
+    // If today has no AC, allow starting check from yesterday (streak not broken yet today)
+    if (!acDays.has(nowIST)) {
+      cursor = new Date(cursor.getTime() - 86400000);
+    }
+
+    while (true) {
+      const dStr = cursor.toISOString().slice(0, 10);
+      if (acDays.has(dStr)) {
+        current++;
+        cursor = new Date(cursor.getTime() - 86400000);
+      } else {
+        break;
+      }
     }
 
     return { current, max: maxS };
