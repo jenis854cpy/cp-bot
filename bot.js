@@ -177,7 +177,16 @@ async function getCFStreak(handle) {
   }
 }
 
-// ─── CF User Info Q (problems by rating bucket via 10000 submissions) ──────────
+// ─── CF User Info Q (problems by rating bucket, 200-pt gaps) ───────────────────
+const RATING_RANGES = [
+  [800, 1000], [1000, 1200], [1200, 1400], [1400, 1600],
+  [1600, 1800], [1800, 2000], [2000, 2200], [2200, 2400], [2400, Infinity],
+];
+
+function rangeLabel([lo, hi]) {
+  return hi === Infinity ? `${lo}+` : `${lo}-${hi}`;
+}
+
 async function getCFUserInfoQ(handle) {
   try {
     const res = await axios.get(
@@ -186,7 +195,9 @@ async function getCFUserInfoQ(handle) {
     );
     const subs = res.data.result || [];
     const solved = new Set();
-    const buckets = { "800-1199": 0, "1200-1599": 0, "1600-1999": 0, "2000+": 0 };
+    const buckets = {};
+    for (const range of RATING_RANGES) buckets[rangeLabel(range)] = 0;
+
     for (const s of subs) {
       if (s.verdict === "OK" && s.problem) {
         const key = `${s.problem.contestId}-${s.problem.index}`;
@@ -194,10 +205,9 @@ async function getCFUserInfoQ(handle) {
           solved.add(key);
           const r = s.problem.rating;
           if (r) {
-            if (r >= 800 && r <= 1199) buckets["800-1199"]++;
-            else if (r >= 1200 && r <= 1599) buckets["1200-1599"]++;
-            else if (r >= 1600 && r <= 1999) buckets["1600-1999"]++;
-            else if (r >= 2000) buckets["2000+"]++;
+            for (const range of RATING_RANGES) {
+              if (r >= range[0] && r < range[1]) { buckets[rangeLabel(range)]++; break; }
+            }
           }
         }
       }
@@ -390,9 +400,9 @@ function rankEmoji(rank) {
   if (r.includes("grandmaster")) return "🔴";
   if (r.includes("international") && r.includes("master")) return "🟠";
   if (r.includes("master")) return "🟠";
-  if (r.includes("candidate")) return "🟡";
+  if (r.includes("candidate")) return "🟣";
   if (r.includes("expert")) return "🔵";
-  if (r.includes("specialist")) return "🟣";
+  if (r.includes("specialist")) return "🟡";
   if (r.includes("pupil")) return "🟢";
   return "⚪";
 }
@@ -670,17 +680,64 @@ async function startBot() {
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
           text += `🏁 Contests: *${info.contests}*\n\n`;
 
+          text += `✅ Total Solved: *${info.totalSolved || "N/A"}*\n\n`;
+
           if (qData) {
             const b = qData.buckets;
             const maxCount = Math.max(...Object.values(b), 1);
             const bar = (n) => "█".repeat(Math.round((n / maxCount) * 12)) + "░".repeat(12 - Math.round((n / maxCount) * 12));
-            text += `✅ Total Solved: *${qData.total}*\n\n`;
             text += `📈 *By Rating:*\n`;
-            text += `  🟢 800–1199  : ${bar(b["800-1199"])} *${b["800-1199"]}*\n`;
-            text += `  🔵 1200–1599 : ${bar(b["1200-1599"])} *${b["1200-1599"]}*\n`;
-            text += `  🟡 1600–1999 : ${bar(b["1600-1999"])} *${b["1600-1999"]}*\n`;
-            text += `  🔴 2000+     : ${bar(b["2000+"])} *${b["2000+"]}*\n`;
+            for (const range of RATING_RANGES) {
+              const label = rangeLabel(range);
+              const count = b[label] || 0;
+              const padded = label.padEnd(9, " ");
+              text += `  ${padded}: ${bar(count)} *${count}*\n`;
+            }
           }
+
+          await reply(text.trim());
+        }
+
+        // ── // compare mem1 mem2 ─────────────────────────────────────────────
+        else if (command.startsWith("// compare")) {
+          const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
+          if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
+          const [h1, h2] = args;
+          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 20-30 seconds_`);
+
+          const [info1, info2, streak1, streak2] = await Promise.all([
+            getCFUserInfo(h1),
+            getCFUserInfo(h2),
+            getCFStreak(h1),
+            getCFStreak(h2),
+          ]);
+
+          if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check handle.`); continue; }
+          if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check handle.`); continue; }
+
+          const r1 = info1.rating ?? -1;
+          const r2 = info2.rating ?? -1;
+          const s1 = info1.totalSolved || 0;
+          const s2 = info2.totalSolved || 0;
+          const m1 = streak1?.max ?? 0;
+          const m2 = streak2?.max ?? 0;
+
+          let text = `⚔️ *${info1.handle}* vs *${info2.handle}*\n${"─".repeat(28)}\n\n`;
+
+          text += `📊 *Rating*\n`;
+          text += `  ${rankEmoji(info1.rank)} ${info1.handle}: *${info1.rating ?? "Unrated"}* (${info1.rank})\n`;
+          text += `  ${rankEmoji(info2.rank)} ${info2.handle}: *${info2.rating ?? "Unrated"}* (${info2.rank})\n`;
+          text += `  ${r1 === r2 ? "🤝 Tie" : r1 > r2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
+
+          text += `✅ *Total Solved*\n`;
+          text += `  ${info1.handle}: *${s1}*\n`;
+          text += `  ${info2.handle}: *${s2}*\n`;
+          text += `  ${s1 === s2 ? "🤝 Tie" : s1 > s2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
+
+          text += `🔥 *Max Streak*\n`;
+          text += `  ${info1.handle}: *${m1} days*\n`;
+          text += `  ${info2.handle}: *${m2} days*\n`;
+          text += `  ${m1 === m2 ? "🤝 Tie" : m1 > m2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}`;
 
           await reply(text.trim());
         }
@@ -699,6 +756,7 @@ async function startBot() {
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
+            `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every contest!*`
           );
