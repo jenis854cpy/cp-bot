@@ -400,7 +400,7 @@ function rankEmoji(rank) {
   if (r.includes("grandmaster")) return "🔴";
   if (r.includes("international") && r.includes("master")) return "🟠";
   if (r.includes("master")) return "🟠";
-  if (r.includes("candidate")) return "🟣";
+  if (r.includes("candidate")) return "🟪";
   if (r.includes("expert")) return "🔵";
   if (r.includes("specialist")) return "🟡";
   if (r.includes("pupil")) return "🟢";
