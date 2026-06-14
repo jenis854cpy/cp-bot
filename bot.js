@@ -393,18 +393,18 @@ async function checkAndAnnounceWinner(sock) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function rankEmoji(rank) {
-  if (!rank) return "⚪";
+  if (!rank) return "⚫";
   const r = rank.toLowerCase();
-  if (r.includes("legendary")) return "👑";
+  if (r.includes("legendary"))                                   return "👑";
   if (r.includes("international") && r.includes("grandmaster")) return "🔴";
-  if (r.includes("grandmaster")) return "🔴";
-  if (r.includes("international") && r.includes("master")) return "🟠";
-  if (r.includes("master")) return "🟠";
-  if (r.includes("candidate")) return "🟣";
-  if (r.includes("expert")) return "🔵";
-  if (r.includes("specialist")) return "🟡";
-  if (r.includes("pupil")) return "🟢";
-  return "⚪";
+  if (r.includes("grandmaster"))                                 return "🔴";
+  if (r.includes("international") && r.includes("master"))      return "🟠";
+  if (r.includes("candidate"))                                   return "🟣";
+  if (r.includes("master"))                                      return "🟠";
+  if (r.includes("expert"))                                      return "🔵";
+  if (r.includes("specialist"))                                  return "🩵";
+  if (r.includes("pupil"))                                       return "🟢";
+  return "⚫";
 }
 
 function streakFire(days) {
