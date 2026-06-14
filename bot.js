@@ -266,6 +266,49 @@ async function getCFUserInfo(handle) {
   } catch { return null; }
 }
 
+// ─── Compare Helper (pure API, no scraping) ──────────────────────────────────
+async function getCFUserForCompare(handle) {
+  try {
+    // Step 1: basic info (rating, rank)
+    const userRes = await axios.get(
+      `https://codeforces.com/api/user.info?handles=${handle}`,
+      { timeout: 8000 }
+    );
+    const u = userRes.data.result[0];
+
+    // Step 2: contest count
+    const ratingRes = await axios.get(
+      `https://codeforces.com/api/user.rating?handle=${handle}`,
+      { timeout: 8000 }
+    );
+    const contests = ratingRes.data.result?.length ?? 0;
+
+    // Step 3: total unique solved from submissions
+    const subRes = await axios.get(
+      `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+      { timeout: 20000 }
+    );
+    const subs = subRes.data.result || [];
+    const solved = new Set();
+    for (const s of subs)
+      if (s.verdict === "OK" && s.problem)
+        solved.add(`${s.problem.contestId}-${s.problem.index}`);
+
+    return {
+      handle: u.handle,
+      rating: u.rating ?? null,
+      maxRating: u.maxRating ?? null,
+      rank: u.rank ?? "newbie",
+      maxRank: u.maxRank ?? "newbie",
+      totalSolved: solved.size,
+      contests,
+    };
+  } catch (e) {
+    console.error(`getCFUserForCompare error for ${handle}:`, e.message);
+    return null;
+  }
+}
+
 // ─── Contest Helpers ──────────────────────────────────────────────────────────
 async function getCFContestList() {
   const res = await axios.get("https://codeforces.com/api/contest.list?gym=false", { timeout: 10000 });
@@ -705,20 +748,28 @@ async function startBot() {
           const [h1, h2] = args;
           await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 20-30 seconds_`);
 
-          const [info1, info2, streak1, streak2] = await Promise.all([
-            getCFUserInfo(h1),
-            getCFUserInfo(h2),
-            getCFStreak(h1),
-            getCFStreak(h2),
-          ]);
+          // Fetch sequentially with delay to avoid CF rate limiting
+          const info1 = await getCFUserForCompare(h1);
+          if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check the handle and try again.`); continue; }
 
-          if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check handle.`); continue; }
-          if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check handle.`); continue; }
+          await sleep(500);
+
+          const info2 = await getCFUserForCompare(h2);
+          if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check the handle and try again.`); continue; }
+
+          await sleep(500);
+
+          // Fetch streaks sequentially too
+          const streak1 = await getCFStreak(h1);
+          await sleep(500);
+          const streak2 = await getCFStreak(h2);
 
           const r1 = info1.rating ?? -1;
           const r2 = info2.rating ?? -1;
           const s1 = info1.totalSolved || 0;
           const s2 = info2.totalSolved || 0;
+          const c1 = info1.contests || 0;
+          const c2 = info2.contests || 0;
           const m1 = streak1?.max ?? 0;
           const m2 = streak2?.max ?? 0;
 
@@ -733,6 +784,11 @@ async function startBot() {
           text += `  ${info1.handle}: *${s1}*\n`;
           text += `  ${info2.handle}: *${s2}*\n`;
           text += `  ${s1 === s2 ? "🤝 Tie" : s1 > s2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
+
+          text += `🏁 *Contests Participated*\n`;
+          text += `  ${info1.handle}: *${c1}*\n`;
+          text += `  ${info2.handle}: *${c2}*\n`;
+          text += `  ${c1 === c2 ? "🤝 Tie" : c1 > c2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
 
           text += `🔥 *Max Streak*\n`;
           text += `  ${info1.handle}: *${m1} days*\n`;
