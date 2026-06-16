@@ -229,10 +229,10 @@ async function getCFUserInfoQ(handle) {
 async function getCFUserInfo(handle) {
   try {
     const [userRes, ratingRes, profileRes] = await Promise.all([
-      axios.get(`https://codeforces.com/api/user.info?handles=${handle}`, { timeout: 8000 }),
-      axios.get(`https://codeforces.com/api/user.rating?handle=${handle}`, { timeout: 8000 }),
+      axios.get(`https://codeforces.com/api/user.info?handles=${handle}`, { timeout: 10000 }),
+      axios.get(`https://codeforces.com/api/user.rating?handle=${handle}`, { timeout: 10000 }),
       axios.get(`https://codeforces.com/profile/${handle}`, {
-        timeout: 10000,
+        timeout: 15000,
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
       }),
     ]);
@@ -269,7 +269,7 @@ async function getCFUserInfo(handle) {
       rank: u.rank ?? "newbie",
       maxRank: u.maxRank ?? "newbie",
       totalSolved,
-      ratingBuckets: {}, // removed brute force — no bucket breakdown
+      ratingBuckets: {},
       contests,
     };
   } catch { return null; }
@@ -329,7 +329,6 @@ async function getContestStandings(contestId, handles) {
 
     for (const row of rows) {
       const members = row.party.members.map((m) => m.handle.toLowerCase());
-      // bestSubmissionTimeSeconds > 0 is the most reliable "solved" indicator
       const acceptedCount = row.problemResults.filter(
         (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
       ).length;
@@ -381,10 +380,9 @@ async function getWeeklyLeaderboard(handles) {
   const nowIST = Date.now() + IST_OFFSET_MS;
   const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
 
-  // Process 5 members in parallel to avoid CF rate limit
   const results = [];
-  for (let i = 0; i < handles.length; i += 5) {
-    const batch = handles.slice(i, i + 5);
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
       try {
         const res = await axios.get(
@@ -405,7 +403,7 @@ async function getWeeklyLeaderboard(handles) {
       } catch { return { handle, count: 0 }; }
     }));
     results.push(...batchResults);
-    if (i + 5 < handles.length) await new Promise(r => setTimeout(r, 500)); // small delay between batches
+    if (i + 2 < handles.length) await sleep(1500);
   }
   return results.sort((a, b) => b.count - a.count);
 }
@@ -417,7 +415,6 @@ async function checkAndSendReminder(sock) {
     if (!upcoming.length) return;
 
     const now = Math.floor(Date.now() / 1000);
-    // Find contests starting in 55-70 min window
     const toRemind = upcoming.filter((c) => {
       const minsLeft = (c.startTimeSeconds - now) / 60;
       return minsLeft >= 55 && minsLeft <= 70;
@@ -438,7 +435,6 @@ async function checkAndSendReminder(sock) {
       const handles = getAllHandles(groupData);
       if (!handles.length) continue;
 
-      // Skip if already sent reminder for this contest
       if (groupData.lastReminderContest === contest.id) continue;
 
       const minsLeft = Math.round((contest.startTimeSeconds - now) / 60);
@@ -726,7 +722,6 @@ async function startBot() {
 
           await reply("🔍 Detecting current/recent contest...");
 
-          // Try running contest first, then most recent finished
           let contest = await getRunningContest();
           let isLive = !!contest;
           if (!contest) contest = await getRecentFinishedContest();
@@ -827,22 +822,29 @@ async function startBot() {
           const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
           const [h1, h2] = args;
-          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 20-30 seconds_`);
+          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 40-50 seconds due to rate limiting protection_`);
 
-          const [info1, info2, streak1, streak2] = await Promise.all([
-            getCFUserInfo(h1),
-            getCFUserInfo(h2),
-            getCFStreak(h1),
-            getCFStreak(h2),
-          ]);
+          // Fetch sequentially to avoid rate limits
+          const info1 = await getCFUserInfo(h1);
+          await sleep(1500);
+          
+          const info2 = await getCFUserInfo(h2);
+          await sleep(1500);
+          
+          const streak1 = await getCFStreak(h1);
+          await sleep(1500);
+          
+          const streak2 = await getCFStreak(h2);
 
-          if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check handle.`); continue; }
-          if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check handle.`); continue; }
+          if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check handle or try again later.`); continue; }
+          if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check handle or try again later.`); continue; }
 
           const r1 = info1.rating ?? -1;
           const r2 = info2.rating ?? -1;
           const s1 = info1.totalSolved || 0;
           const s2 = info2.totalSolved || 0;
+          const c1 = info1.contests || 0;
+          const c2 = info2.contests || 0;
           const m1 = streak1?.max ?? 0;
           const m2 = streak2?.max ?? 0;
 
@@ -858,6 +860,11 @@ async function startBot() {
           text += `  ${info2.handle}: *${s2}*\n`;
           text += `  ${s1 === s2 ? "🤝 Tie" : s1 > s2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
 
+          text += `🏁 *Contests Participated*\n`;
+          text += `  ${info1.handle}: *${c1}*\n`;
+          text += `  ${info2.handle}: *${c2}*\n`;
+          text += `  ${c1 === c2 ? "🤝 Tie" : c1 > c2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
+
           text += `🔥 *Max Streak*\n`;
           text += `  ${info1.handle}: *${m1} days*\n`;
           text += `  ${info2.handle}: *${m2} days*\n`;
@@ -870,7 +877,9 @@ async function startBot() {
         else if (command === "// leaderboard week") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take 15-20 seconds_`);
+          
+          const estimatedSeconds = Math.ceil(handles.length * 0.75);
+          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
 
           const results = await getWeeklyLeaderboard(handles);
           const active = results.filter((r) => r.count > 0);
@@ -898,6 +907,111 @@ Start grinding! 💪`;
           await reply(text.trim());
         }
 
+        // ── // solvedtoday <problem_url> ─────────────────────────────────────
+        else if (command.startsWith("// solvedtoday")) {
+          const url = body.slice(13).trim();
+          
+          if (!url) {
+            await reply("❌ Usage: `// solvedtoday <problem_url>`\nExample: `// solvedtoday https://codeforces.com/contest/1790/problem/D`");
+            continue;
+          }
+          
+          const match = url.match(/codeforces\.com\/contest\/(\d+)\/problem\/([A-Z0-9]+)/i);
+          if (!match) {
+            await reply("❌ Invalid Codeforces problem URL.\nExample: `https://codeforces.com/contest/1790/problem/D`");
+            continue;
+          }
+          
+          const contestId = match[1];
+          const problemIndex = match[2].toUpperCase();
+          const handles = getAllHandles(groupData);
+          
+          if (!handles.length) {
+            await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
+            continue;
+          }
+          
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s)_`);
+          
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const todayIST = new Date(Date.now() + IST_OFFSET_MS);
+          todayIST.setHours(0, 0, 0, 0);
+          const todayStartIST = todayIST.getTime();
+          
+          const solvedToday = [];
+          const notSolved = [];
+          const errors = [];
+          
+          for (let i = 0; i < handles.length; i += 3) {
+            const batch = handles.slice(i, i + 3);
+            const batchResults = await Promise.all(batch.map(async (handle) => {
+              try {
+                const res = await axios.get(
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+                  { timeout: 10000 }
+                );
+                const subs = res.data.result || [];
+                let solved = false;
+                
+                for (const s of subs) {
+                  if (s.verdict === "OK" && s.problem) {
+                    const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
+                    if (subTimeIST >= todayStartIST) {
+                      if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
+                        solved = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+                return { handle, solved };
+              } catch (e) {
+                return { handle, solved: false, error: true };
+              }
+            }));
+            
+            for (const result of batchResults) {
+              if (result.error) {
+                errors.push(result.handle);
+              } else if (result.solved) {
+                solvedToday.push(result.handle);
+              } else {
+                notSolved.push(result.handle);
+              }
+            }
+            
+            if (i + 3 < handles.length) await sleep(1500);
+          }
+          
+          let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
+          text += `📅 Today's Solves (IST)\n`;
+          text += `${"─".repeat(28)}\n\n`;
+          
+          if (solvedToday.length === 0) {
+            text += `😴 No one solved this problem today.\n\n`;
+            text += `💪 Be the first! Try solving it now!`;
+          } else {
+            text += `✅ *Solved today:*\n`;
+            solvedToday.forEach((h, i) => {
+              text += `  ${i + 1}. *${h}*\n`;
+            });
+            text += `\n`;
+          }
+          
+          if (notSolved.length > 0) {
+            text += `❌ *Not solved yet:*\n`;
+            text += `${notSolved.join(", ")}\n\n`;
+          }
+          
+          if (errors.length > 0) {
+            text += `⚠️ *Could not fetch:* ${errors.join(", ")}\n`;
+          }
+          
+          text += `\n🔗 ${url}`;
+          
+          await reply(text.trim());
+        }
+
         // ── // help ───────────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
@@ -912,8 +1026,9 @@ Start grinding! 💪`;
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
-            `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
+            `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
             `🏅 \`// leaderboard week\`\n    Who solved most problems this week\n\n` +
+            `📝 \`// solvedtoday <problem_url>\`\n    Who solved a specific problem today\n    Example: \`// solvedtoday https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every contest!*\n` +
             `⏰ *Auto-reminds 1 hour before every CF contest!*`
