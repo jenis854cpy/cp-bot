@@ -375,20 +375,20 @@ async function getLeetCodeUpcoming() {
   } catch { return []; }
 }
 
-// ─── Weekly Leaderboard (last 50 subs per member, IST week) ─────────────────
+// ─── Weekly Leaderboard (last 100 subs per member, IST week) ─────────────────
 async function getWeeklyLeaderboard(handles) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const nowIST = Date.now() + IST_OFFSET_MS;
   const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
 
-  // Process 2 members at a time to respect CF rate limits
+  // Process 5 members in parallel to avoid CF rate limit
   const results = [];
-  for (let i = 0; i < handles.length; i += 2) {
-    const batch = handles.slice(i, i + 2);
+  for (let i = 0; i < handles.length; i += 5) {
+    const batch = handles.slice(i, i + 5);
     const batchResults = await Promise.all(batch.map(async (handle) => {
       try {
         const res = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=50`,
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
           { timeout: 10000 }
         );
         const subs = res.data.result || [];
@@ -405,8 +405,7 @@ async function getWeeklyLeaderboard(handles) {
       } catch { return { handle, count: 0 }; }
     }));
     results.push(...batchResults);
-    // Wait 1.5 seconds between batches to respect rate limits
-    if (i + 2 < handles.length) await sleep(1500);
+    if (i + 5 < handles.length) await new Promise(r => setTimeout(r, 500)); // small delay between batches
   }
   return results.sort((a, b) => b.count - a.count);
 }
@@ -871,10 +870,7 @@ async function startBot() {
         else if (command === "// leaderboard week") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          
-          // Calculate estimated time
-          const estimatedSeconds = Math.ceil(handles.length * 0.75);
-          await reply(`⏳ Fetching last 50 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
+          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take 15-20 seconds_`);
 
           const results = await getWeeklyLeaderboard(handles);
           const active = results.filter((r) => r.count > 0);
