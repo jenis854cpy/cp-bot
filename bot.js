@@ -375,7 +375,7 @@ async function getLeetCodeUpcoming() {
   } catch { return []; }
 }
 
-// ─── Weekly Leaderboard (last 100 subs per member, IST week) ─────────────────
+// ─── Weekly Leaderboard (last 50 subs per member, IST week) ─────────────────
 async function getWeeklyLeaderboard(handles) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const nowIST = Date.now() + IST_OFFSET_MS;
@@ -388,7 +388,7 @@ async function getWeeklyLeaderboard(handles) {
     const batchResults = await Promise.all(batch.map(async (handle) => {
       try {
         const res = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=50`,
           { timeout: 10000 }
         );
         const subs = res.data.result || [];
@@ -874,7 +874,7 @@ async function startBot() {
           
           // Calculate estimated time
           const estimatedSeconds = Math.ceil(handles.length * 0.75);
-          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
+          await reply(`⏳ Fetching last 50 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
 
           const results = await getWeeklyLeaderboard(handles);
           const active = results.filter((r) => r.count > 0);
