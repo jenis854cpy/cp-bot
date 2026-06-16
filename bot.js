@@ -381,10 +381,10 @@ async function getWeeklyLeaderboard(handles) {
   const nowIST = Date.now() + IST_OFFSET_MS;
   const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
 
-  // Process 5 members in parallel to avoid CF rate limit
+  // Process 2 members at a time to respect CF rate limits
   const results = [];
-  for (let i = 0; i < handles.length; i += 5) {
-    const batch = handles.slice(i, i + 5);
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
       try {
         const res = await axios.get(
@@ -405,7 +405,8 @@ async function getWeeklyLeaderboard(handles) {
       } catch { return { handle, count: 0 }; }
     }));
     results.push(...batchResults);
-    if (i + 5 < handles.length) await new Promise(r => setTimeout(r, 500)); // small delay between batches
+    // Wait 1.5 seconds between batches to respect rate limits
+    if (i + 2 < handles.length) await sleep(1500);
   }
   return results.sort((a, b) => b.count - a.count);
 }
@@ -870,7 +871,10 @@ async function startBot() {
         else if (command === "// leaderboard week") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take 15-20 seconds_`);
+          
+          // Calculate estimated time
+          const estimatedSeconds = Math.ceil(handles.length * 0.75);
+          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
 
           const results = await getWeeklyLeaderboard(handles);
           const active = results.filter((r) => r.count > 0);
