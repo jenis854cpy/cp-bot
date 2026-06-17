@@ -29,6 +29,7 @@ const CFData = mongoose.model("CFData",
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
     lastContestAnnounced: { type: Number, default: 0 },
+    lastReminderContest: { type: Number, default: 0 },
   }));
 
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
@@ -77,13 +78,21 @@ async function useMongoAuthState() {
 // ─── Group Data ────────────────────────────────────────────────────────────────
 async function getGroupData(chatId) {
   const group = await CFData.findOne({ chatId }).lean();
-  if (!group) return { members: {}, lastContestAnnounced: 0 };
-  return { members: group.members || {}, lastContestAnnounced: group.lastContestAnnounced || 0 };
+  if (!group) return { members: {}, lastContestAnnounced: 0, lastReminderContest: 0 };
+  return {
+    members: group.members || {},
+    lastContestAnnounced: group.lastContestAnnounced || 0,
+    lastReminderContest: group.lastReminderContest || 0,
+  };
 }
 
 async function saveGroupData(chatId, groupData) {
   await CFData.findOneAndUpdate({ chatId },
-    { $set: { members: groupData.members, lastContestAnnounced: groupData.lastContestAnnounced } },
+    { $set: {
+      members: groupData.members,
+      lastContestAnnounced: groupData.lastContestAnnounced,
+      lastReminderContest: groupData.lastReminderContest ?? 0,
+    }},
     { upsert: true });
 }
 
@@ -165,7 +174,7 @@ async function getCFStreak(handle) {
   }
 }
 
-// ─── CF User Info Q ───────────────────────────────────────────────────────────
+// ─── CF User Info Q (problems by rating bucket) ──────────────────────────────
 const RATING_RANGES = [
   [800, 1000], [1000, 1200], [1200, 1400], [1400, 1600],
   [1600, 1800], [1800, 2000], [2000, 2200], [2200, 2400], [2400, Infinity],
@@ -382,6 +391,79 @@ async function getLeetCodeUpcoming() {
   } catch { return []; }
 }
 
+// ─── Weekly Leaderboard ──────────────────────────────────────────────────────
+async function getWeeklyLeaderboard(handles) {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const nowIST = Date.now() + IST_OFFSET_MS;
+  const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
+  const results = [];
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
+    const batchResults = await Promise.all(batch.map(async (handle) => {
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+          { timeout: 10000 }
+        );
+        const subs = res.data.result || [];
+        const solved = new Set();
+        for (const s of subs) {
+          if (s.verdict === "OK" && s.problem) {
+            const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
+            if (subTimeIST >= weekAgoIST) {
+              solved.add(`${s.problem.contestId}-${s.problem.index}`);
+            }
+          }
+        }
+        return { handle, count: solved.size };
+      } catch { return { handle, count: 0 }; }
+    }));
+    results.push(...batchResults);
+    if (i + 2 < handles.length) await sleep(1500);
+  }
+  return results.sort((a, b) => b.count - a.count);
+}
+
+// ─── Contest Reminder (1 hour before) ──────────────────────────────────────
+async function checkAndSendReminder(sock) {
+  try {
+    const upcoming = await getCFUpcoming();
+    if (!upcoming.length) return;
+    const now = Math.floor(Date.now() / 1000);
+    const toRemind = upcoming.filter((c) => {
+      const minsLeft = (c.startTimeSeconds - now) / 60;
+      return minsLeft >= 55 && minsLeft <= 70;
+    });
+    if (!toRemind.length) return;
+    const contest = toRemind[0];
+    const groups = await CFData.find({}).lean();
+    for (const group of groups) {
+      const chatId = group.chatId;
+      if (!chatId.endsWith("@g.us")) continue;
+      const groupData = {
+        members: group.members || {},
+        lastContestAnnounced: group.lastContestAnnounced || 0,
+        lastReminderContest: group.lastReminderContest || 0,
+      };
+      const handles = getAllHandles(groupData);
+      if (!handles.length) continue;
+      if (groupData.lastReminderContest === contest.id) continue;
+      const minsLeft = Math.round((contest.startTimeSeconds - now) / 60);
+      let text = `⏰ *Contest Starting Soon!*\n${"─".repeat(28)}\n\n`;
+      text += `🔵 *${contest.name}*\n`;
+      text += `🕐 Starts in: *${minsLeft} minutes*\n`;
+      text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
+      text += `🔗 https://codeforces.com/contest/${contest.id}\n\n`;
+      text += `👥 *Registered members:*\n${handles.join(", ")}\n\n`;
+      text += `💪 Good luck everyone!`;
+      try {
+        await sock.sendMessage(chatId, { text });
+        await saveGroupData(chatId, { ...groupData, lastReminderContest: contest.id });
+      } catch (e) { console.error(`Reminder send error ${chatId}:`, e.message); }
+    }
+  } catch (e) { console.error("checkAndSendReminder error:", e.message); }
+}
+
 // ─── Winner Checker ───────────────────────────────────────────────────────────
 async function checkAndAnnounceWinner(sock) {
   const groups = await CFData.find({}).lean();
@@ -498,8 +580,10 @@ async function startBot() {
     if (connection === "open") {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
+      setInterval(() => checkAndSendReminder(sock), 5 * 60 * 1000);
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
+      setTimeout(() => checkAndSendReminder(sock), 3 * 60 * 1000);
     }
   });
 
@@ -658,6 +742,64 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // contest <contest_id_or_url> ───────────────────────────────────
+        else if (command.startsWith("// contest ")) {
+          const input = body.slice(10).trim();
+          if (!input) {
+            await reply("❌ Usage: `// contest <contest_id>` or `// contest <contest_url>`\nExample: `// contest 1790` or `// contest https://codeforces.com/contest/1790`");
+            continue;
+          }
+          let contestId = null;
+          const urlMatch = input.match(/codeforces\.com\/contest\/(\d+)/i);
+          if (urlMatch) {
+            contestId = urlMatch[1];
+          } else if (/^\d+$/.test(input)) {
+            contestId = input;
+          } else {
+            await reply("❌ Invalid format. Provide a contest ID (e.g., `1790`) or a Codeforces contest URL.");
+            continue;
+          }
+          const handles = getAllHandles(groupData);
+          if (!handles.length) {
+            await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
+            continue;
+          }
+          await reply(`⏳ Fetching standings for contest *${contestId}*...\n_May take 10-20 seconds_`);
+          const [{ problems, contest }, solvedMap] = await Promise.all([
+            getContestDetails(contestId),
+            getContestStandings(contestId, handles),
+          ]);
+          if (!contest || !solvedMap) {
+            await reply(`❌ Could not fetch contest ${contestId}. Check the ID and try again.`);
+            continue;
+          }
+          const totalProblems = problems.length;
+          const problemLetters = problems.map((p) => p.index).join(" ");
+          const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+          const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
+          const now = Math.floor(Date.now() / 1000);
+          let statusEmoji = "📊";
+          if (contest.phase === "CODING") statusEmoji = "🟢 *LIVE*";
+          else if (contest.phase === "BEFORE") statusEmoji = "⏳ *UPCOMING*";
+          else if (contest.phase === "FINISHED") statusEmoji = "🏁 *FINISHED*";
+          let text = `${statusEmoji} *${contest.name}*\n`;
+          text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
+          text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
+          if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
+          text += `${"─".repeat(28)}\n\n`;
+          if (!participated.length) {
+            text += `😴 No group members participated in this contest.`;
+          } else {
+            participated.forEach(([h, s], i) => {
+              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+              text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
+            });
+            if (notParticipated.length) text += `\n😴 Not participated: ${notParticipated.join(", ")}`;
+          }
+          text += `\n🔗 https://codeforces.com/contest/${contestId}`;
+          await reply(text.trim());
+        }
+
         // ── // whosolved <problem_url> ──────────────────────────────────────
         else if (command.startsWith("// whosolved ")) {
           const url = body.slice(13).trim();
@@ -667,7 +809,7 @@ async function startBot() {
             continue;
           }
           
-          // Extract contest ID and problem index from URL
+          // Extract contest ID and problem index from URL (supports both /contest/ and /problemset/ formats)
           const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
           if (!match) {
             await reply("❌ Invalid Codeforces problem URL.\nExamples:\n`https://codeforces.com/contest/1790/problem/D`\n`https://codeforces.com/problemset/problem/1790/D`");
@@ -852,6 +994,28 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // leaderboard week ──────────────────────────────────────────────
+        else if (command === "// leaderboard week") {
+          const handles = getAllHandles(groupData);
+          if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
+          const estimatedSeconds = Math.ceil(handles.length * 0.75);
+          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
+          const results = await getWeeklyLeaderboard(handles);
+          const active = results.filter((r) => r.count > 0);
+          let text = `🏅 *Weekly Leaderboard*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
+          if (!active.length) {
+            text += `😴 No one solved any problems this week!\nStart grinding! 💪`;
+          } else {
+            active.forEach((r, i) => {
+              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+              text += `${medal} *${r.handle}* — ${r.count} problem${r.count > 1 ? "s" : ""}\n`;
+            });
+            const inactive = results.filter((r) => r.count === 0);
+            if (inactive.length) text += `\n😴 No activity: ${inactive.map(r => r.handle).join(", ")}`;
+          }
+          await reply(text.trim());
+        }
+
         // ── // help ───────────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
@@ -864,12 +1028,15 @@ async function startBot() {
             `👤 \`// myrating\`\n    Your own CF rating & rank\n\n` +
             `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n\n` +
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
+            `📋 \`// contest <id_or_url>\`\n    Show standings for a specific contest\n    Example: \`// contest 1790\` or \`// contest https://codeforces.com/contest/1790\`\n\n` +
             `🔍 \`// whosolved <problem_url>\`\n    Check who solved a specific problem\n    Example: \`// whosolved https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
+            `🏅 \`// leaderboard week\`\n    Who solved most problems this week\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
-            `🏁 *Auto-announces group winner after every contest!*`
+            `🏁 *Auto-announces group winner after every contest!*\n` +
+            `⏰ *Auto-reminds 1 hour before every CF contest!*`
           );
         }
 
