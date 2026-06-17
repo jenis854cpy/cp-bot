@@ -470,7 +470,7 @@ async function checkAndAnnounceWinner(sock) {
         const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
         text += `${medal} *${h}* — ${s} solved\n`;
       });
-      const notParticipated = handles.filter((h) => !solvedMap[h]);
+      const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
       if (notParticipated.length) text += `\n😴 Didn't participate: ${notParticipated.join(", ")}`;
       await sock.sendMessage(chatId, { text });
       await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
@@ -486,7 +486,7 @@ async function getRecentFinishedContest() {
   } catch { return null; }
 }
 
-// ─── Contest Helpers (for // solved and // contest) ──────────────────────────
+// ─── Contest Helpers ──────────────────────────────────────────────────────────
 async function getRunningContest() {
   try {
     const list = await getCFContestList();
@@ -495,12 +495,14 @@ async function getRunningContest() {
   } catch { return null; }
 }
 
+// Lightweight function to get contest details (problems, name, etc.)
 async function getContestDetails(contestId) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
       { timeout: 12000 }
     );
+    if (!res.data || !res.data.result) return { problems: [], contest: null };
     return {
       problems: res.data.result.problems || [],
       contest: res.data.result.contest,
@@ -511,32 +513,48 @@ async function getContestDetails(contestId) {
   }
 }
 
+// ─── IMPROVED getContestStandings ────────────────────────────────────────────
+// Uses the 'handles' parameter to fetch only your group members.
+// Fast, reliable, and works for any contest (old or new).
 async function getContestStandings(contestId, handles) {
+  if (!handles || handles.length === 0) return {};
+
+  // Build the handles string (semicolon‑separated)
+  const handlesStr = handles.join(';');
+
   try {
-    const res = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`,
-      { timeout: 35000 } // increased timeout
-    );
+    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesStr}&showUnofficial=true`;
+    const res = await axios.get(url, { timeout: 25000 });
+
+    if (!res.data || res.data.status !== 'OK') {
+      console.error('CF API returned error:', res.data?.comment);
+      return null;
+    }
+
     const rows = res.data.result.rows;
-    const handleLower = handles.map((h) => h.toLowerCase());
     const solvedMap = {};
+
+    // Each row corresponds to a participant (or team)
     for (const row of rows) {
-      const members = row.party.members.map((m) => m.handle.toLowerCase());
+      const memberHandles = row.party.members.map(m => m.handle);
       const acceptedCount = row.problemResults.filter(
-        (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
+        p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
       ).length;
-      for (const m of members) {
-        const idx = handleLower.indexOf(m);
-        if (idx !== -1) {
-          const orig = handles[idx];
-          if (!solvedMap[orig] || acceptedCount > solvedMap[orig])
-            solvedMap[orig] = acceptedCount;
-        }
+
+      // Assign the count to each member in the party (handles teams gracefully)
+      for (const h of memberHandles) {
+        solvedMap[h] = acceptedCount;
       }
     }
+
+    // Ensure every handle is in the map (set to 0 if missing)
+    for (const h of handles) {
+      if (!(h in solvedMap)) solvedMap[h] = 0;
+    }
+
     return solvedMap;
-  } catch (e) {
-    console.error(`getContestStandings error for ${contestId}:`, e.message);
+  } catch (err) {
+    console.error(`getContestStandings error for contest ${contestId}:`, err.message);
     return null;
   }
 }
@@ -785,13 +803,11 @@ async function startBot() {
           if (!contest) contest = await getRecentFinishedContest();
           if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
-          const [{ problems }, solvedMap] = await Promise.all([
-            getContestDetails(contest.id),
-            getContestStandings(contest.id, handles),
-          ]);
+          const solvedMap = await getContestStandings(contest.id, handles);
           if (!solvedMap) { await reply("❌ Failed to fetch standings. CF API may be down. Try again."); continue; }
-          const totalProblems = problems.length;
-          const problemLetters = problems.map((p) => p.index).join(" ");
+          const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
+          const totalProblems = problems ? problems.length : 0;
+          const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
           const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
           let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
@@ -835,7 +851,7 @@ async function startBot() {
             continue;
           }
 
-          // First, verify the contest exists by fetching contest list
+          // Verify contest exists
           let contestInfo = null;
           try {
             const list = await getCFContestList();
@@ -850,32 +866,35 @@ async function startBot() {
             continue;
           }
 
-          await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take 10-20 seconds_`);
+          await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take a few seconds_`);
 
-          const [{ problems, contest }, solvedMap] = await Promise.all([
-            getContestDetails(contestId),
-            getContestStandings(contestId, handles),
-          ]);
-
-          if (!solvedMap || !contest) {
-            await reply(`❌ Could not fetch standings for contest ${contestId}. It might be too large or the API is rate-limiting. Please try again later.`);
+          // Fetch standings using the handles parameter (fast)
+          const solvedMap = await getContestStandings(contestId, handles);
+          if (!solvedMap) {
+            await reply(`❌ Could not fetch standings for contest ${contestId}. Please try again later.`);
             continue;
           }
 
-          const totalProblems = problems.length;
-          const problemLetters = problems.map((p) => p.index).join(" ");
+          // Get problem details (optional)
+          const { problems } = await getContestDetails(contestId);
+          const totalProblems = problems ? problems.length : 0;
+          const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
+
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
           const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
+
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
-          if (contest.phase === "CODING") statusEmoji = "🟢 *LIVE*";
-          else if (contest.phase === "BEFORE") statusEmoji = "⏳ *UPCOMING*";
-          else if (contest.phase === "FINISHED") statusEmoji = "🏁 *FINISHED*";
-          let text = `${statusEmoji} *${contest.name}*\n`;
-          text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
-          text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
+          if (contestInfo.phase === "CODING") statusEmoji = "🟢 *LIVE*";
+          else if (contestInfo.phase === "BEFORE") statusEmoji = "⏳ *UPCOMING*";
+          else if (contestInfo.phase === "FINISHED") statusEmoji = "🏁 *FINISHED*";
+
+          let text = `${statusEmoji} *${contestInfo.name}*\n`;
+          text += `📅 ${formatIST(contestInfo.startTimeSeconds)}\n`;
+          text += `⏱ Duration: ${formatDuration(contestInfo.durationSeconds)}\n`;
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
+
           if (!participated.length) {
             text += `😴 No group members participated in this contest.`;
           } else {
