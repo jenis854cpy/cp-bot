@@ -486,7 +486,7 @@ async function getRecentFinishedContest() {
   } catch { return null; }
 }
 
-// ─── Contest Helpers (for // solved and // contest) ──────────────────────────
+// ─── Contest Helpers ──────────────────────────────────────────────────────────
 async function getRunningContest() {
   try {
     const list = await getCFContestList();
@@ -495,12 +495,14 @@ async function getRunningContest() {
   } catch { return null; }
 }
 
+// Lightweight function to get contest details (problems, name, etc.)
 async function getContestDetails(contestId) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
       { timeout: 12000 }
     );
+    if (!res.data || !res.data.result) return { problems: [], contest: null };
     return {
       problems: res.data.result.problems || [],
       contest: res.data.result.contest,
@@ -511,34 +513,75 @@ async function getContestDetails(contestId) {
   }
 }
 
-async function getContestStandings(contestId, handles) {
+// Main standings fetcher (with fallback to per‑user submissions)
+async function getContestStandings(contestId, handles, contestProblems) {
+  // Try official standings first
   try {
     const res = await axios.get(
       `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`,
-      { timeout: 35000 } // increased timeout
+      { timeout: 35000 }
     );
-    const rows = res.data.result.rows;
-    const handleLower = handles.map((h) => h.toLowerCase());
-    const solvedMap = {};
-    for (const row of rows) {
-      const members = row.party.members.map((m) => m.handle.toLowerCase());
-      const acceptedCount = row.problemResults.filter(
-        (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
-      ).length;
-      for (const m of members) {
-        const idx = handleLower.indexOf(m);
-        if (idx !== -1) {
-          const orig = handles[idx];
-          if (!solvedMap[orig] || acceptedCount > solvedMap[orig])
-            solvedMap[orig] = acceptedCount;
+    if (res.data && res.data.result && res.data.result.rows) {
+      const rows = res.data.result.rows;
+      const handleLower = handles.map((h) => h.toLowerCase());
+      const solvedMap = {};
+      for (const row of rows) {
+        const members = row.party.members.map((m) => m.handle.toLowerCase());
+        const acceptedCount = row.problemResults.filter(
+          (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
+        ).length;
+        for (const m of members) {
+          const idx = handleLower.indexOf(m);
+          if (idx !== -1) {
+            const orig = handles[idx];
+            if (!solvedMap[orig] || acceptedCount > solvedMap[orig])
+              solvedMap[orig] = acceptedCount;
+          }
         }
       }
+      return solvedMap;
     }
-    return solvedMap;
   } catch (e) {
-    console.error(`getContestStandings error for ${contestId}:`, e.message);
-    return null;
+    console.error(`getContestStandings (standings) error for ${contestId}:`, e.message);
   }
+
+  // Fallback: fetch submissions per member and count accepted problems in this contest
+  console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
+  const problemSet = new Set(contestProblems.map(p => p.index.toUpperCase()));
+  const solvedMap = {};
+  const totalProblems = contestProblems.length;
+
+  // Process in batches of 2
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
+    const batchResults = await Promise.all(batch.map(async (handle) => {
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=5000`,
+          { timeout: 15000 }
+        );
+        const subs = res.data.result || [];
+        const solved = new Set();
+        for (const s of subs) {
+          if (s.verdict === "OK" && s.problem && s.problem.contestId == contestId) {
+            const idx = s.problem.index.toUpperCase();
+            if (problemSet.has(idx)) {
+              solved.add(idx);
+            }
+          }
+        }
+        return { handle, count: solved.size };
+      } catch (e) {
+        console.error(`Failed to fetch submissions for ${handle}:`, e.message);
+        return { handle, count: 0 };
+      }
+    }));
+    for (const r of batchResults) {
+      solvedMap[r.handle] = r.count;
+    }
+    if (i + 2 < handles.length) await sleep(1500);
+  }
+  return solvedMap;
 }
 
 // ─── Weekly Leaderboard ──────────────────────────────────────────────────────
@@ -852,13 +895,11 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take 10-20 seconds_`);
 
-          const [{ problems, contest }, solvedMap] = await Promise.all([
-            getContestDetails(contestId),
-            getContestStandings(contestId, handles),
-          ]);
+          const { problems, contest } = await getContestDetails(contestId);
+          const solvedMap = await getContestStandings(contestId, handles, problems || []);
 
-          if (!solvedMap || !contest) {
-            await reply(`❌ Could not fetch standings for contest ${contestId}. It might be too large or the API is rate-limiting. Please try again later.`);
+          if (!solvedMap) {
+            await reply(`❌ Could not fetch standings for contest ${contestId}. Please try again later.`);
             continue;
           }
 
@@ -868,12 +909,12 @@ async function startBot() {
           const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
-          if (contest.phase === "CODING") statusEmoji = "🟢 *LIVE*";
-          else if (contest.phase === "BEFORE") statusEmoji = "⏳ *UPCOMING*";
-          else if (contest.phase === "FINISHED") statusEmoji = "🏁 *FINISHED*";
-          let text = `${statusEmoji} *${contest.name}*\n`;
-          text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
-          text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
+          if (contest && contest.phase === "CODING") statusEmoji = "🟢 *LIVE*";
+          else if (contest && contest.phase === "BEFORE") statusEmoji = "⏳ *UPCOMING*";
+          else if (contest && contest.phase === "FINISHED") statusEmoji = "🏁 *FINISHED*";
+          let text = `${statusEmoji} *${contestInfo.name}*\n`;
+          text += `📅 ${formatIST(contestInfo.startTimeSeconds)}\n`;
+          text += `⏱ Duration: ${formatDuration(contestInfo.durationSeconds)}\n`;
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
           if (!participated.length) {
