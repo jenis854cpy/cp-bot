@@ -486,7 +486,7 @@ async function getRecentFinishedContest() {
   } catch { return null; }
 }
 
-// ─── Existing Contest Helpers ──────────────────────────────────────────────
+// ─── Contest Helpers (for // solved and // contest) ──────────────────────────
 async function getRunningContest() {
   try {
     const list = await getCFContestList();
@@ -505,14 +505,17 @@ async function getContestDetails(contestId) {
       problems: res.data.result.problems || [],
       contest: res.data.result.contest,
     };
-  } catch { return { problems: [], contest: null }; }
+  } catch (e) {
+    console.error(`getContestDetails error for ${contestId}:`, e.message);
+    return { problems: [], contest: null };
+  }
 }
 
 async function getContestStandings(contestId, handles) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`,
-      { timeout: 25000 }
+      { timeout: 35000 } // increased timeout
     );
     const rows = res.data.result.rows;
     const handleLower = handles.map((h) => h.toLowerCase());
@@ -533,7 +536,7 @@ async function getContestStandings(contestId, handles) {
     }
     return solvedMap;
   } catch (e) {
-    console.error("standings error:", e.message);
+    console.error(`getContestStandings error for ${contestId}:`, e.message);
     return null;
   }
 }
@@ -825,20 +828,40 @@ async function startBot() {
             await reply("❌ Invalid format. Provide a contest ID (e.g., `1790`) or a Codeforces contest URL.");
             continue;
           }
+
           const handles = getAllHandles(groupData);
           if (!handles.length) {
             await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
             continue;
           }
-          await reply(`⏳ Fetching standings for contest *${contestId}*...\n_May take 10-20 seconds_`);
+
+          // First, verify the contest exists by fetching contest list
+          let contestInfo = null;
+          try {
+            const list = await getCFContestList();
+            const found = list.find(c => c.id == contestId);
+            if (found) contestInfo = found;
+          } catch (e) {
+            console.error("Error fetching contest list:", e.message);
+          }
+
+          if (!contestInfo) {
+            await reply(`❌ Contest ${contestId} does not exist or is not a regular Codeforces round (gym contests not supported).`);
+            continue;
+          }
+
+          await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take 10-20 seconds_`);
+
           const [{ problems, contest }, solvedMap] = await Promise.all([
             getContestDetails(contestId),
             getContestStandings(contestId, handles),
           ]);
-          if (!contest || !solvedMap) {
-            await reply(`❌ Could not fetch contest ${contestId}. Check the ID and try again.`);
+
+          if (!solvedMap || !contest) {
+            await reply(`❌ Could not fetch standings for contest ${contestId}. It might be too large or the API is rate-limiting. Please try again later.`);
             continue;
           }
+
           const totalProblems = problems.length;
           const problemLetters = problems.map((p) => p.index).join(" ");
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
@@ -900,7 +923,6 @@ async function startBot() {
           
           const solvedToday = [];
           
-          // Process 2 members at a time (like leaderboard week)
           for (let i = 0; i < handles.length; i += 2) {
             const batch = handles.slice(i, i + 2);
             const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -937,7 +959,6 @@ async function startBot() {
             if (i + 2 < handles.length) await sleep(1500);
           }
           
-          // Build response – only show solvers
           let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
           text += `📅 Today's Solves (IST)\n`;
           text += `${"─".repeat(28)}\n\n`;
