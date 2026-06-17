@@ -824,9 +824,10 @@ async function startBot() {
             continue;
           }
           
-          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — may take 15-25 seconds_`);
+          // Estimate time: ~2 seconds per member (API call) + 1.5s per batch (2 members per batch)
+          const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — may take ~${estimatedSeconds} seconds_`);
           
-          // Today's start in IST
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
           const todayIST = new Date(Date.now() + IST_OFFSET_MS);
           todayIST.setHours(0, 0, 0, 0);
@@ -836,51 +837,53 @@ async function startBot() {
           const notSolved = [];
           const errors = [];
           
-          // Process 1 member at a time to avoid rate limits
-          for (let i = 0; i < handles.length; i += 1) {
-            const handle = handles[i];
-            try {
-              // Fetch last 10000 submissions (more than enough)
-              const res = await axios.get(
-                `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-                { timeout: 15000 }
-              );
-              const subs = res.data.result || [];
-              let solved = false;
-              
-              for (const s of subs) {
-                if (s.verdict === "OK" && s.problem) {
-                  const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
-                  if (subTimeIST >= todayStartIST) {
-                    if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
-                      solved = true;
-                      break;
+          // Process 2 members at a time (like leaderboard week)
+          for (let i = 0; i < handles.length; i += 2) {
+            const batch = handles.slice(i, i + 2);
+            const batchResults = await Promise.all(batch.map(async (handle) => {
+              try {
+                const res = await axios.get(
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+                  { timeout: 10000 }
+                );
+                const subs = res.data.result || [];
+                let solved = false;
+                for (const s of subs) {
+                  if (s.verdict === "OK" && s.problem) {
+                    const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
+                    if (subTimeIST >= todayStartIST) {
+                      if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
+                        solved = true;
+                        break;
+                      }
                     }
                   }
                 }
+                return { handle, solved };
+              } catch (e) {
+                return { handle, solved: false, error: true };
               }
-              
-              if (solved) {
-                solvedToday.push(handle);
+            }));
+            
+            for (const result of batchResults) {
+              if (result.error) {
+                errors.push(result.handle);
+              } else if (result.solved) {
+                solvedToday.push(result.handle);
               } else {
-                notSolved.push(handle);
+                notSolved.push(result.handle);
               }
-            } catch (e) {
-              errors.push(handle);
             }
             
-            // Wait 1 second between each user
-            if (i + 1 < handles.length) await sleep(1000);
+            if (i + 2 < handles.length) await sleep(1500);
           }
           
-          // Build response
           let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
           text += `📅 Today's Solves (IST)\n`;
           text += `${"─".repeat(28)}\n\n`;
           
           if (solvedToday.length === 0) {
-            text += `😴 No one solved this problem today.\n\n`;
-            text += `💪 Be the first! Try solving it now!`;
+            text += `😴 No one solved this problem today.\n\n💪 Be the first! Try solving it now!`;
           } else {
             text += `✅ *Solved today:*\n`;
             solvedToday.forEach((h, i) => {
@@ -890,8 +893,7 @@ async function startBot() {
           }
           
           if (notSolved.length > 0) {
-            text += `❌ *Not solved yet:*\n`;
-            text += `${notSolved.join(", ")}\n\n`;
+            text += `❌ *Not solved yet:*\n${notSolved.join(", ")}\n\n`;
           }
           
           if (errors.length > 0) {
@@ -899,7 +901,6 @@ async function startBot() {
           }
           
           text += `\n🔗 ${url}`;
-          
           await reply(text.trim());
         }
 
