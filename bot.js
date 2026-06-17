@@ -29,7 +29,6 @@ const CFData = mongoose.model("CFData",
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
     lastContestAnnounced: { type: Number, default: 0 },
-    // New: stores reminder sent flags per contest per platform
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
@@ -300,14 +299,13 @@ async function getCFContestList() {
   return res.data.result;
 }
 
-// Returns upcoming Codeforces contests with unified format
 async function getCFUpcoming() {
   try {
     const list = await getCFContestList();
     return list
       .filter((c) => c.phase === "BEFORE")
       .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
-      .slice(0, 10) // fetch a few to cover next 24h
+      .slice(0, 10)
       .map((c) => ({
         id: `cf-${c.id}`,
         platform: "Codeforces",
@@ -319,7 +317,6 @@ async function getCFUpcoming() {
   } catch { return []; }
 }
 
-// Returns upcoming CodeChef contests with unified format
 async function getCodeChefUpcoming() {
   try {
     const res = await axios.get("https://competeapi.vercel.app/contests/upcoming/", { timeout: 10000 });
@@ -339,7 +336,6 @@ async function getCodeChefUpcoming() {
   } catch { return []; }
 }
 
-// Returns upcoming LeetCode contests with unified format
 async function getLeetCodeUpcoming() {
   try {
     const res = await axios.post(
@@ -366,14 +362,12 @@ async function getLeetCodeUpcoming() {
 // ─── Unified Reminder System ─────────────────────────────────────────────────
 async function checkAndSendReminders(sock) {
   try {
-    // Gather upcoming contests from all platforms
     const [cf, cc, lc] = await Promise.all([
       getCFUpcoming(),
       getCodeChefUpcoming(),
       getLeetCodeUpcoming(),
     ]);
     const allContests = [...cf, ...cc, ...lc];
-
     if (!allContests.length) return;
 
     const now = Math.floor(Date.now() / 1000);
@@ -383,16 +377,14 @@ async function checkAndSendReminders(sock) {
       const chatId = group.chatId;
       if (!chatId.endsWith("@g.us")) continue;
 
-      // Load group data with reminders
       const groupData = await getGroupData(chatId);
       const handles = getAllHandles(groupData);
-      if (!handles.length) continue; // skip groups with no members
+      if (!handles.length) continue;
 
       const reminders = groupData.reminders || {};
 
       for (const contest of allContests) {
         const diff = contest.startTimeSeconds - now;
-        // Check if we should send 1‑day reminder: between 23.5 and 24.5 hours
         if (diff >= 23.5 * 3600 && diff <= 24.5 * 3600) {
           if (!reminders[contest.id]?.daySent) {
             await sendReminder(sock, chatId, contest, "day");
@@ -400,7 +392,6 @@ async function checkAndSendReminders(sock) {
             reminders[contest.id].daySent = true;
           }
         }
-        // Check if we should send 1‑hour reminder: between 45 and 75 minutes
         if (diff >= 45 * 60 && diff <= 75 * 60) {
           if (!reminders[contest.id]?.hourSent) {
             await sendReminder(sock, chatId, contest, "hour");
@@ -410,7 +401,6 @@ async function checkAndSendReminders(sock) {
         }
       }
 
-      // Save updated reminders
       groupData.reminders = reminders;
       await saveGroupData(chatId, groupData);
     }
@@ -496,7 +486,7 @@ async function getRecentFinishedContest() {
   } catch { return null; }
 }
 
-// ─── Existing Contest Helpers (for // solved, // contest) ──────────────────
+// ─── Existing Contest Helpers ──────────────────────────────────────────────
 async function getRunningContest() {
   try {
     const list = await getCFContestList();
@@ -662,14 +652,9 @@ async function startBot() {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
 
-      // ─── Unified Reminders ────────────────────────────────────────────────
-      setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000); // every 10 minutes
-
-      // ─── Winner Checker (Codeforces) ─────────────────────────────────────
+      setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
-
-      // Also run reminders immediately after startup
       setTimeout(() => checkAndSendReminders(sock), 30 * 1000);
     }
   });
@@ -767,13 +752,12 @@ async function startBot() {
         // ── // upcoming ───────────────────────────────────────────────────────
         else if (command === "// upcoming") {
           await reply("⏳ Fetching upcoming contests from all platforms...");
-          const [cfContests, lcContests, ccContests] = await Promise.all([
+          const [cf, lc, cc] = await Promise.all([
             getCFUpcoming(),
             getLeetCodeUpcoming(),
             getCodeChefUpcoming(),
           ]);
-          // Now they are already unified, but we need to format them differently for display
-          const all = [...cfContests, ...lcContests, ...ccContests].slice(0, 8);
+          const all = [...cf, ...lc, ...cc].slice(0, 8);
           let text = `📅 *Upcoming Contests*\n${"─".repeat(28)}\n\n`;
           if (!all.length) {
             text += `😴 No upcoming contests right now.`;
@@ -915,9 +899,8 @@ async function startBot() {
           const todayStartIST = todayIST.getTime();
           
           const solvedToday = [];
-          const notSolved = [];
-          const errors = [];
           
+          // Process 2 members at a time (like leaderboard week)
           for (let i = 0; i < handles.length; i += 2) {
             const batch = handles.slice(i, i + 2);
             const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -940,44 +923,32 @@ async function startBot() {
                   }
                 }
                 return { handle, solved };
-              } catch (e) {
-                return { handle, solved: false, error: true };
+              } catch {
+                return { handle, solved: false };
               }
             }));
             
             for (const result of batchResults) {
-              if (result.error) {
-                errors.push(result.handle);
-              } else if (result.solved) {
+              if (result.solved) {
                 solvedToday.push(result.handle);
-              } else {
-                notSolved.push(result.handle);
               }
             }
             
             if (i + 2 < handles.length) await sleep(1500);
           }
           
+          // Build response – only show solvers
           let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
           text += `📅 Today's Solves (IST)\n`;
           text += `${"─".repeat(28)}\n\n`;
           
           if (solvedToday.length === 0) {
-            text += `😴 No one solved this problem today.\n\n💪 Be the first! Try solving it now!`;
+            text += `😴 No one solved this problem today.`;
           } else {
             text += `✅ *Solved today:*\n`;
             solvedToday.forEach((h, i) => {
               text += `  ${i + 1}. *${h}*\n`;
             });
-            text += `\n`;
-          }
-          
-          if (notSolved.length > 0) {
-            text += `❌ *Not solved yet:*\n${notSolved.join(", ")}\n\n`;
-          }
-          
-          if (errors.length > 0) {
-            text += `⚠️ *Could not fetch:* ${errors.join(", ")}\n`;
           }
           
           text += `\n🔗 ${url}`;
