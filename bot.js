@@ -123,7 +123,7 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
-// ─── Streak (brute force 10000 submissions — IST day boundaries) ──────────────
+// ─── Streak ──────────────────────────────────────────────────────────────────
 function toISTDateStr(unixSeconds) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const d = new Date(unixSeconds * 1000 + IST_OFFSET_MS);
@@ -174,7 +174,7 @@ async function getCFStreak(handle) {
   }
 }
 
-// ─── CF User Info Q (problems by rating bucket) ──────────────────────────────
+// ─── CF User Info Q ──────────────────────────────────────────────────────────
 const RATING_RANGES = [
   [800, 1000], [1000, 1200], [1200, 1400], [1400, 1600],
   [1600, 1800], [1800, 2000], [2000, 2200], [2200, 2400], [2400, Infinity],
@@ -256,7 +256,7 @@ async function getCFUserInfo(handle) {
   } catch { return null; }
 }
 
-// ─── Compare Helper (pure API) ───────────────────────────────────────────────
+// ─── Compare Helper ─────────────────────────────────────────────────────────
 async function getCFUserForCompare(handle) {
   try {
     const userRes = await axios.get(
@@ -424,7 +424,7 @@ async function getWeeklyLeaderboard(handles) {
   return results.sort((a, b) => b.count - a.count);
 }
 
-// ─── Contest Reminder (1 hour before) ──────────────────────────────────────
+// ─── Contest Reminder ──────────────────────────────────────────────────────
 async function checkAndSendReminder(sock) {
   try {
     const upcoming = await getCFUpcoming();
@@ -800,16 +800,15 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // whosolved <problem_url> ──────────────────────────────────────
-        else if (command.startsWith("// whosolved ")) {
-          const url = body.slice(13).trim();
+        // ── // whosolvedtoday <problem_url> ─────────────────────────────────
+        else if (command.startsWith("// whosolvedtoday ")) {
+          const url = body.slice(18).trim();
           
           if (!url) {
-            await reply("❌ Usage: `// whosolved <problem_url>`\nExample: `// whosolved https://codeforces.com/contest/1790/problem/D`");
+            await reply("❌ Usage: `// whosolvedtoday <problem_url>`\nExample: `// whosolvedtoday https://codeforces.com/contest/1790/problem/D`");
             continue;
           }
           
-          // Extract contest ID and problem index from URL (supports both /contest/ and /problemset/ formats)
           const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
           if (!match) {
             await reply("❌ Invalid Codeforces problem URL.\nExamples:\n`https://codeforces.com/contest/1790/problem/D`\n`https://codeforces.com/problemset/problem/1790/D`");
@@ -825,62 +824,66 @@ async function startBot() {
             continue;
           }
           
-          await reply(`🔍 Checking who solved *${contestId}${problemIndex}*...\n_Checking ${handles.length} member(s) — may take 10-20 seconds_`);
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — may take 15-25 seconds_`);
           
-          const solvedList = [];
+          // Today's start in IST
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const todayIST = new Date(Date.now() + IST_OFFSET_MS);
+          todayIST.setHours(0, 0, 0, 0);
+          const todayStartIST = todayIST.getTime();
+          
+          const solvedToday = [];
           const notSolved = [];
           const errors = [];
           
-          // Process 2 members at a time to respect CF rate limits
-          for (let i = 0; i < handles.length; i += 2) {
-            const batch = handles.slice(i, i + 2);
-            const batchResults = await Promise.all(batch.map(async (handle) => {
-              try {
-                // Fetch last 1000 submissions (enough to cover most solves)
-                const res = await axios.get(
-                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=1000`,
-                  { timeout: 12000 }
-                );
-                const subs = res.data.result || [];
-                let solved = false;
-                
-                for (const s of subs) {
-                  if (s.verdict === "OK" && s.problem) {
+          // Process 1 member at a time to avoid rate limits
+          for (let i = 0; i < handles.length; i += 1) {
+            const handle = handles[i];
+            try {
+              // Fetch last 10000 submissions (more than enough)
+              const res = await axios.get(
+                `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+                { timeout: 15000 }
+              );
+              const subs = res.data.result || [];
+              let solved = false;
+              
+              for (const s of subs) {
+                if (s.verdict === "OK" && s.problem) {
+                  const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
+                  if (subTimeIST >= todayStartIST) {
                     if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
                       solved = true;
                       break;
                     }
                   }
                 }
-                return { handle, solved };
-              } catch (e) {
-                return { handle, solved: false, error: true };
               }
-            }));
-            
-            for (const result of batchResults) {
-              if (result.error) {
-                errors.push(result.handle);
-              } else if (result.solved) {
-                solvedList.push(result.handle);
+              
+              if (solved) {
+                solvedToday.push(handle);
               } else {
-                notSolved.push(result.handle);
+                notSolved.push(handle);
               }
+            } catch (e) {
+              errors.push(handle);
             }
             
-            if (i + 2 < handles.length) await sleep(1500);
+            // Wait 1 second between each user
+            if (i + 1 < handles.length) await sleep(1000);
           }
           
           // Build response
           let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
+          text += `📅 Today's Solves (IST)\n`;
           text += `${"─".repeat(28)}\n\n`;
           
-          if (solvedList.length === 0) {
-            text += `😴 No one in the group has solved this problem yet.\n\n`;
+          if (solvedToday.length === 0) {
+            text += `😴 No one solved this problem today.\n\n`;
             text += `💪 Be the first! Try solving it now!`;
           } else {
-            text += `✅ *Solved:*\n`;
-            solvedList.forEach((h, i) => {
+            text += `✅ *Solved today:*\n`;
+            solvedToday.forEach((h, i) => {
               text += `  ${i + 1}. *${h}*\n`;
             });
             text += `\n`;
@@ -1029,7 +1032,7 @@ async function startBot() {
             `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n\n` +
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
             `📋 \`// contest <id_or_url>\`\n    Show standings for a specific contest\n    Example: \`// contest 1790\` or \`// contest https://codeforces.com/contest/1790\`\n\n` +
-            `🔍 \`// whosolved <problem_url>\`\n    Check who solved a specific problem\n    Example: \`// whosolved https://codeforces.com/contest/1790/problem/D\`\n\n` +
+            `📅 \`// whosolvedtoday <problem_url>\`\n    Check who solved a problem today (IST)\n    Example: \`// whosolvedtoday https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
