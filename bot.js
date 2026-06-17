@@ -930,7 +930,6 @@ async function startBot() {
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
 
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
-          const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
 
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
@@ -951,7 +950,6 @@ async function startBot() {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
               text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
             });
-            if (notParticipated.length) text += `\n😴 Not participated: ${notParticipated.join(", ")}`;
           }
           text += `\n🔗 https://codeforces.com/contest/${contestId}`;
           await reply(text.trim());
