@@ -29,7 +29,6 @@ const CFData = mongoose.model("CFData",
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
     lastContestAnnounced: { type: Number, default: 0 },
-    lastReminderContest: { type: Number, default: 0 },
   }));
 
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
@@ -78,21 +77,13 @@ async function useMongoAuthState() {
 // ─── Group Data ────────────────────────────────────────────────────────────────
 async function getGroupData(chatId) {
   const group = await CFData.findOne({ chatId }).lean();
-  if (!group) return { members: {}, lastContestAnnounced: 0, lastReminderContest: 0 };
-  return {
-    members: group.members || {},
-    lastContestAnnounced: group.lastContestAnnounced || 0,
-    lastReminderContest: group.lastReminderContest || 0,
-  };
+  if (!group) return { members: {}, lastContestAnnounced: 0 };
+  return { members: group.members || {}, lastContestAnnounced: group.lastContestAnnounced || 0 };
 }
 
 async function saveGroupData(chatId, groupData) {
   await CFData.findOneAndUpdate({ chatId },
-    { $set: {
-      members: groupData.members,
-      lastContestAnnounced: groupData.lastContestAnnounced,
-      lastReminderContest: groupData.lastReminderContest ?? 0,
-    }},
+    { $set: { members: groupData.members, lastContestAnnounced: groupData.lastContestAnnounced } },
     { upsert: true });
 }
 
@@ -124,11 +115,10 @@ async function getCFUsers(handles) {
 }
 
 // ─── Streak (brute force 10000 submissions — IST day boundaries) ──────────────
-// Converts each submission's UTC timestamp to an IST calendar date (UTC+5:30)
 function toISTDateStr(unixSeconds) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const d = new Date(unixSeconds * 1000 + IST_OFFSET_MS);
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD in IST
+  return d.toISOString().slice(0, 10);
 }
 
 async function getCFStreak(handle) {
@@ -143,12 +133,8 @@ async function getCFStreak(handle) {
       if (s.verdict === "OK")
         acDays.add(toISTDateStr(s.creationTimeSeconds));
     }
-
     if (acDays.size === 0) return { current: 0, max: 0 };
-
     const sortedAsc = [...acDays].sort();
-
-    // Max streak — count consecutive calendar days
     let maxS = 1, curS = 1;
     for (let i = 1; i < sortedAsc.length; i++) {
       const prev = new Date(sortedAsc[i - 1] + "T00:00:00Z");
@@ -156,19 +142,13 @@ async function getCFStreak(handle) {
       const diffDays = Math.round((curr - prev) / 86400000);
       if (diffDays === 1) { curS++; maxS = Math.max(maxS, curS); }
       else if (diffDays > 1) curS = 1;
-      // diffDays === 0 shouldn't happen since acDays is a Set of unique dates
     }
-
-    // Current streak — walk backwards from today (IST) or yesterday
     const nowIST = toISTDateStr(Math.floor(Date.now() / 1000));
     let current = 0;
     let cursor = new Date(nowIST + "T00:00:00Z");
-
-    // If today has no AC, allow starting check from yesterday (streak not broken yet today)
     if (!acDays.has(nowIST)) {
       cursor = new Date(cursor.getTime() - 86400000);
     }
-
     while (true) {
       const dStr = cursor.toISOString().slice(0, 10);
       if (acDays.has(dStr)) {
@@ -178,7 +158,6 @@ async function getCFStreak(handle) {
         break;
       }
     }
-
     return { current, max: maxS };
   } catch (e) {
     console.error("getCFStreak error:", e.message);
@@ -186,7 +165,7 @@ async function getCFStreak(handle) {
   }
 }
 
-// ─── CF User Info Q (problems by rating bucket, 200-pt gaps) ───────────────────
+// ─── CF User Info Q ───────────────────────────────────────────────────────────
 const RATING_RANGES = [
   [800, 1000], [1000, 1200], [1200, 1400], [1400, 1600],
   [1600, 1800], [1800, 2000], [2000, 2200], [2200, 2400], [2400, Infinity],
@@ -206,7 +185,6 @@ async function getCFUserInfoQ(handle) {
     const solved = new Set();
     const buckets = {};
     for (const range of RATING_RANGES) buckets[rangeLabel(range)] = 0;
-
     for (const s of subs) {
       if (s.verdict === "OK" && s.problem) {
         const key = `${s.problem.contestId}-${s.problem.index}`;
@@ -225,7 +203,7 @@ async function getCFUserInfoQ(handle) {
   } catch { return null; }
 }
 
-// ─── CF User Info (scrapes profile page — fast, accurate) ─────────────────────
+// ─── CF User Info (scrapes profile) ──────────────────────────────────────────
 async function getCFUserInfo(handle) {
   try {
     const [userRes, ratingRes, profileRes] = await Promise.all([
@@ -236,12 +214,9 @@ async function getCFUserInfo(handle) {
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
       }),
     ]);
-
     const u = userRes.data.result[0];
     const contests = ratingRes.data.result?.length ?? 0;
     const html = profileRes.data;
-
-    // Extract total solved from profile page
     let totalSolved = 0;
     const solvedPatterns = [
       /(\d+)\s*problems?\s*solved/i,
@@ -254,14 +229,11 @@ async function getCFUserInfo(handle) {
       const m = html.match(p);
       if (m) { totalSolved = parseInt(m[1]); break; }
     }
-
-    // Fallback: look for number near "solved" text
     if (!totalSolved) {
       const section = html.match(/solved[\s\S]{0,200}/i)?.[0] || "";
       const num = section.match(/(\d+)/)?.[1];
       if (num) totalSolved = parseInt(num);
     }
-
     return {
       handle: u.handle,
       rating: u.rating ?? null,
@@ -269,30 +241,25 @@ async function getCFUserInfo(handle) {
       rank: u.rank ?? "newbie",
       maxRank: u.maxRank ?? "newbie",
       totalSolved,
-      ratingBuckets: {}, // removed brute force — no bucket breakdown
+      ratingBuckets: {},
       contests,
     };
   } catch { return null; }
 }
 
-// ─── Compare Helper (pure API, no scraping) ──────────────────────────────────
+// ─── Compare Helper (pure API) ───────────────────────────────────────────────
 async function getCFUserForCompare(handle) {
   try {
-    // Step 1: basic info (rating, rank)
     const userRes = await axios.get(
       `https://codeforces.com/api/user.info?handles=${handle}`,
       { timeout: 8000 }
     );
     const u = userRes.data.result[0];
-
-    // Step 2: contest count
     const ratingRes = await axios.get(
       `https://codeforces.com/api/user.rating?handle=${handle}`,
       { timeout: 8000 }
     );
     const contests = ratingRes.data.result?.length ?? 0;
-
-    // Step 3: total unique solved from submissions
     const subRes = await axios.get(
       `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
       { timeout: 20000 }
@@ -302,7 +269,6 @@ async function getCFUserForCompare(handle) {
     for (const s of subs)
       if (s.verdict === "OK" && s.problem)
         solved.add(`${s.problem.contestId}-${s.problem.index}`);
-
     return {
       handle: u.handle,
       rating: u.rating ?? null,
@@ -380,10 +346,8 @@ async function getContestStandings(contestId, handles) {
     const rows = res.data.result.rows;
     const handleLower = handles.map((h) => h.toLowerCase());
     const solvedMap = {};
-
     for (const row of rows) {
       const members = row.party.members.map((m) => m.handle.toLowerCase());
-      // bestSubmissionTimeSeconds > 0 is the most reliable "solved" indicator
       const acceptedCount = row.problemResults.filter(
         (p) => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
       ).length;
@@ -416,101 +380,6 @@ async function getLeetCodeUpcoming() {
       .sort((a, b) => a.startTime - b.startTime)
       .slice(0, 2);
   } catch { return []; }
-}
-
-// ─── Weekly Leaderboard (last 100 subs per member, IST week) ─────────────────
-async function getWeeklyLeaderboard(handles) {
-  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-  const nowIST = Date.now() + IST_OFFSET_MS;
-  const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
-
-  // Process 2 members at a time to respect CF rate limits
-  const results = [];
-  for (let i = 0; i < handles.length; i += 2) {
-    const batch = handles.slice(i, i + 2);
-    const batchResults = await Promise.all(batch.map(async (handle) => {
-      try {
-        const res = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
-          { timeout: 10000 }
-        );
-        const subs = res.data.result || [];
-        const solved = new Set();
-        for (const s of subs) {
-          if (s.verdict === "OK" && s.problem) {
-            const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
-            if (subTimeIST >= weekAgoIST) {
-              solved.add(`${s.problem.contestId}-${s.problem.index}`);
-            }
-          }
-        }
-        return { handle, count: solved.size };
-      } catch { return { handle, count: 0 }; }
-    }));
-    results.push(...batchResults);
-    // Wait 1.5 seconds between batches to respect rate limits
-    if (i + 2 < handles.length) await sleep(1500);
-  }
-  return results.sort((a, b) => b.count - a.count);
-}
-
-// ─── Contest Reminder (1 hour before) ──────────────────────────────────────────
-async function checkAndSendReminder(sock) {
-  try {
-    const upcoming = await getCFUpcoming();
-    if (!upcoming.length) return;
-
-    const now = Math.floor(Date.now() / 1000);
-    // Find contests starting in 55-70 min window (1 hour before)
-    const toRemind = upcoming.filter((c) => {
-      const minsLeft = (c.startTimeSeconds - now) / 60;
-      return minsLeft >= 55 && minsLeft <= 70;
-    });
-    if (!toRemind.length) return;
-
-    const contest = toRemind[0];
-    const groups = await CFData.find({}).lean();
-
-    for (const group of groups) {
-      const chatId = group.chatId;
-      if (!chatId.endsWith("@g.us")) continue;
-      const groupData = {
-        members: group.members || {},
-        lastContestAnnounced: group.lastContestAnnounced || 0,
-        lastReminderContest: group.lastReminderContest || 0,
-      };
-      const handles = getAllHandles(groupData);
-      if (!handles.length) continue;
-
-      // Skip if already sent reminder for this contest
-      if (groupData.lastReminderContest === contest.id) continue;
-
-      const minsLeft = Math.round((contest.startTimeSeconds - now) / 60);
-      let text = `⏰ *Contest Starting Soon!*
-${"─".repeat(28)}
-
-`;
-      text += `🔵 *${contest.name}*
-`;
-      text += `🕐 Starts in: *${minsLeft} minutes*
-`;
-      text += `📅 ${formatIST(contest.startTimeSeconds)}
-`;
-      text += `🔗 https://codeforces.com/contest/${contest.id}
-
-`;
-      text += `👥 *Registered members:*
-${handles.join(", ")}
-
-`;
-      text += `💪 Good luck everyone!`;
-
-      try {
-        await sock.sendMessage(chatId, { text });
-        await saveGroupData(chatId, { ...groupData, lastReminderContest: contest.id });
-      } catch (e) { console.error(`Reminder send error ${chatId}:`, e.message); }
-    }
-  } catch (e) { console.error("checkAndSendReminder error:", e.message); }
 }
 
 // ─── Winner Checker ───────────────────────────────────────────────────────────
@@ -573,14 +442,6 @@ function streakFire(days) {
   return "💤";
 }
 
-function solvedEmoji(count) {
-  if (count >= 101) return "🚀";
-  if (count >= 61)  return "💫";
-  if (count >= 31)  return "🔥";
-  if (count >= 11)  return "⭐";
-  return "🌱";
-}
-
 function formatDuration(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -637,13 +498,8 @@ async function startBot() {
     if (connection === "open") {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
-      // Check for contest reminders every 5 minutes
-      setInterval(() => checkAndSendReminder(sock), 5 * 60 * 1000);
-      // Check for winners every 5 minutes
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
-      // Initial checks after bot starts
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
-      setTimeout(() => checkAndSendReminder(sock), 3 * 60 * 1000);
     }
   });
 
@@ -770,35 +626,26 @@ async function startBot() {
         else if (command === "// solved") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-
           await reply("🔍 Detecting current/recent contest...");
-
-          // Try running contest first, then most recent finished
           let contest = await getRunningContest();
           let isLive = !!contest;
           if (!contest) contest = await getRecentFinishedContest();
           if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
-
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
-
           const [{ problems }, solvedMap] = await Promise.all([
             getContestDetails(contest.id),
             getContestStandings(contest.id, handles),
           ]);
-
           if (!solvedMap) { await reply("❌ Failed to fetch standings. CF API may be down. Try again."); continue; }
-
           const totalProblems = problems.length;
           const problemLetters = problems.map((p) => p.index).join(" ");
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
           const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
-
           let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
           text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
-
           if (!participated.length) {
             text += `😴 No group members have participated yet.`;
           } else {
@@ -811,6 +658,106 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // whosolved <problem_url> ──────────────────────────────────────
+        else if (command.startsWith("// whosolved ")) {
+          const url = body.slice(13).trim();
+          
+          if (!url) {
+            await reply("❌ Usage: `// whosolved <problem_url>`\nExample: `// whosolved https://codeforces.com/contest/1790/problem/D`");
+            continue;
+          }
+          
+          // Extract contest ID and problem index from URL
+          const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
+          if (!match) {
+            await reply("❌ Invalid Codeforces problem URL.\nExamples:\n`https://codeforces.com/contest/1790/problem/D`\n`https://codeforces.com/problemset/problem/1790/D`");
+            continue;
+          }
+          
+          const contestId = match[1];
+          const problemIndex = match[2].toUpperCase();
+          const handles = getAllHandles(groupData);
+          
+          if (!handles.length) {
+            await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
+            continue;
+          }
+          
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}*...\n_Checking ${handles.length} member(s) — may take 10-20 seconds_`);
+          
+          const solvedList = [];
+          const notSolved = [];
+          const errors = [];
+          
+          // Process 2 members at a time to respect CF rate limits
+          for (let i = 0; i < handles.length; i += 2) {
+            const batch = handles.slice(i, i + 2);
+            const batchResults = await Promise.all(batch.map(async (handle) => {
+              try {
+                // Fetch last 1000 submissions (enough to cover most solves)
+                const res = await axios.get(
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=1000`,
+                  { timeout: 12000 }
+                );
+                const subs = res.data.result || [];
+                let solved = false;
+                
+                for (const s of subs) {
+                  if (s.verdict === "OK" && s.problem) {
+                    if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
+                      solved = true;
+                      break;
+                    }
+                  }
+                }
+                return { handle, solved };
+              } catch (e) {
+                return { handle, solved: false, error: true };
+              }
+            }));
+            
+            for (const result of batchResults) {
+              if (result.error) {
+                errors.push(result.handle);
+              } else if (result.solved) {
+                solvedList.push(result.handle);
+              } else {
+                notSolved.push(result.handle);
+              }
+            }
+            
+            if (i + 2 < handles.length) await sleep(1500);
+          }
+          
+          // Build response
+          let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
+          text += `${"─".repeat(28)}\n\n`;
+          
+          if (solvedList.length === 0) {
+            text += `😴 No one in the group has solved this problem yet.\n\n`;
+            text += `💪 Be the first! Try solving it now!`;
+          } else {
+            text += `✅ *Solved:*\n`;
+            solvedList.forEach((h, i) => {
+              text += `  ${i + 1}. *${h}*\n`;
+            });
+            text += `\n`;
+          }
+          
+          if (notSolved.length > 0) {
+            text += `❌ *Not solved yet:*\n`;
+            text += `${notSolved.join(", ")}\n\n`;
+          }
+          
+          if (errors.length > 0) {
+            text += `⚠️ *Could not fetch:* ${errors.join(", ")}\n`;
+          }
+          
+          text += `\n🔗 ${url}`;
+          
+          await reply(text.trim());
+        }
+
         // ── // streak <cf_id> ─────────────────────────────────────────────────
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
@@ -818,19 +765,16 @@ async function startBot() {
           await reply(`⏳ Fetching streak for *${arg}*... _May take 10-15 seconds_`);
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
-
           const curFire = streakFire(streak.current);
           const maxFire = streakFire(streak.max);
           let text = `🔥 *Streak — ${arg}*\n${"─".repeat(28)}\n\n`;
           text += `${curFire} Current Streak: *${streak.current} days*\n`;
           text += `🏆 Max Streak Ever: *${streak.max} days* ${maxFire}\n`;
-
           if (streak.current === 0) text += `\n💤 No active streak.\n💪 Solve a problem today to start one!`;
           else if (streak.current >= 30) text += `\n🚀 Incredible! Keep it going!`;
           else if (streak.current >= 15) text += `\n💪 Great streak! Don't break it!`;
           else if (streak.current >= 7) text += `\n⭐ One week+ streak!`;
           else text += `\n📈 Good start! Keep solving daily!`;
-
           await reply(text);
         }
 
@@ -844,15 +788,12 @@ async function startBot() {
             getCFUserInfoQ(arg),
           ]);
           if (!info) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
-
           let text = `👤 *${info.handle}*\n${"─".repeat(28)}\n\n`;
           text += `${rankEmoji(info.rank)} Rank: *${info.rank}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
           text += `🏁 Contests: *${info.contests}*\n\n`;
-
           text += `✅ Total Solved: *${info.totalSolved || "N/A"}*\n\n`;
-
           if (qData) {
             const b = qData.buckets;
             const maxCount = Math.max(...Object.values(b), 1);
@@ -865,7 +806,6 @@ async function startBot() {
               text += `  ${padded}: ${bar(count)} *${count}*\n`;
             }
           }
-
           await reply(text.trim());
         }
 
@@ -875,23 +815,15 @@ async function startBot() {
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
           const [h1, h2] = args;
           await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 20-30 seconds_`);
-
-          // Fetch sequentially with delay to avoid CF rate limiting
           const info1 = await getCFUserForCompare(h1);
           if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check the handle and try again.`); continue; }
-
           await sleep(500);
-
           const info2 = await getCFUserForCompare(h2);
           if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check the handle and try again.`); continue; }
-
           await sleep(500);
-
-          // Fetch streaks sequentially too
           const streak1 = await getCFStreak(h1);
           await sleep(500);
           const streak2 = await getCFStreak(h2);
-
           const r1 = info1.rating ?? -1;
           const r2 = info2.rating ?? -1;
           const s1 = info1.totalSolved || 0;
@@ -900,64 +832,23 @@ async function startBot() {
           const c2 = info2.contests || 0;
           const m1 = streak1?.max ?? 0;
           const m2 = streak2?.max ?? 0;
-
           let text = `⚔️ *${info1.handle}* vs *${info2.handle}*\n${"─".repeat(28)}\n\n`;
-
           text += `📊 *Rating*\n`;
           text += `  ${rankEmoji(info1.rank)} ${info1.handle}: *${info1.rating ?? "Unrated"}* (${info1.rank})\n`;
           text += `  ${rankEmoji(info2.rank)} ${info2.handle}: *${info2.rating ?? "Unrated"}* (${info2.rank})\n`;
           text += `  ${r1 === r2 ? "🤝 Tie" : r1 > r2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
-
           text += `✅ *Total Solved*\n`;
           text += `  ${info1.handle}: *${s1}*\n`;
           text += `  ${info2.handle}: *${s2}*\n`;
           text += `  ${s1 === s2 ? "🤝 Tie" : s1 > s2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
-
           text += `🏁 *Contests Participated*\n`;
           text += `  ${info1.handle}: *${c1}*\n`;
           text += `  ${info2.handle}: *${c2}*\n`;
           text += `  ${c1 === c2 ? "🤝 Tie" : c1 > c2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
-
           text += `🔥 *Max Streak*\n`;
           text += `  ${info1.handle}: *${m1} days*\n`;
           text += `  ${info2.handle}: *${m2} days*\n`;
           text += `  ${m1 === m2 ? "🤝 Tie" : m1 > m2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}`;
-
-          await reply(text.trim());
-        }
-
-        // ── // leaderboard week ──────────────────────────────────────────────
-        else if (command === "// leaderboard week") {
-          const handles = getAllHandles(groupData);
-          if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          
-          // Calculate estimated time
-          const estimatedSeconds = Math.ceil(handles.length * 0.75);
-          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
-
-          const results = await getWeeklyLeaderboard(handles);
-          const active = results.filter((r) => r.count > 0);
-
-          let text = `🏅 *Weekly Leaderboard*
-${"─".repeat(28)}
-📅 Last 7 days (IST)
-
-`;
-
-          if (!active.length) {
-            text += `😴 No one solved any problems this week!
-Start grinding! 💪`;
-          } else {
-            active.forEach((r, i) => {
-              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${r.handle}* — ${r.count} problem${r.count > 1 ? "s" : ""}
-`;
-            });
-            const inactive = results.filter((r) => r.count === 0);
-            if (inactive.length) text += `
-😴 No activity: ${inactive.map(r => r.handle).join(", ")}`;
-          }
-
           await reply(text.trim());
         }
 
@@ -973,13 +864,12 @@ Start grinding! 💪`;
             `👤 \`// myrating\`\n    Your own CF rating & rank\n\n` +
             `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n\n` +
             `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
+            `🔍 \`// whosolved <problem_url>\`\n    Check who solved a specific problem\n    Example: \`// whosolved https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
-            `🏅 \`// leaderboard week\`\n    Who solved most problems this week\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
-            `🏁 *Auto-announces group winner after every contest!*\n` +
-            `⏰ *Auto-reminds 1 hour before every CF contest!*`
+            `🏁 *Auto-announces group winner after every contest!*`
           );
         }
 
