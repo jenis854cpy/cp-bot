@@ -513,50 +513,98 @@ async function getContestDetails(contestId) {
   }
 }
 
-// ─── IMPROVED getContestStandings ────────────────────────────────────────────
-// Uses the 'handles' parameter to fetch only your group members.
-// Fast, reliable, and works for any contest (old or new).
+// ─── getContestStandings with case‑insensitive matching ──────────────────────
 async function getContestStandings(contestId, handles) {
   if (!handles || handles.length === 0) return {};
 
-  // Build the handles string (semicolon‑separated)
-  const handlesStr = handles.join(';');
+  // Build a map from lowercase to original handle
+  const lowerToOriginal = {};
+  for (const h of handles) {
+    lowerToOriginal[h.toLowerCase()] = h;
+  }
 
+  // 1. Try official standings API with handles parameter
   try {
+    const handlesStr = handles.join(';');
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesStr}&showUnofficial=true`;
     const res = await axios.get(url, { timeout: 25000 });
 
-    if (!res.data || res.data.status !== 'OK') {
-      console.error('CF API returned error:', res.data?.comment);
-      return null;
-    }
+    // If we have rows, build the map
+    if (res.data && res.data.result && res.data.result.rows && res.data.result.rows.length > 0) {
+      const rows = res.data.result.rows;
+      const solvedMap = {};
+      // Initialize with 0 for all input handles
+      for (const h of handles) solvedMap[h] = 0;
 
-    const rows = res.data.result.rows;
-    const solvedMap = {};
-
-    // Each row corresponds to a participant (or team)
-    for (const row of rows) {
-      const memberHandles = row.party.members.map(m => m.handle);
-      const acceptedCount = row.problemResults.filter(
-        p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
-      ).length;
-
-      // Assign the count to each member in the party (handles teams gracefully)
-      for (const h of memberHandles) {
-        solvedMap[h] = acceptedCount;
+      for (const row of rows) {
+        const memberHandles = row.party.members.map(m => m.handle);
+        const acceptedCount = row.problemResults.filter(
+          p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
+        ).length;
+        for (const apiHandle of memberHandles) {
+          const lower = apiHandle.toLowerCase();
+          // Find the corresponding input handle (case-insensitive)
+          const original = lowerToOriginal[lower];
+          if (original) {
+            solvedMap[original] = acceptedCount;
+          }
+        }
       }
+      return solvedMap;
     }
-
-    // Ensure every handle is in the map (set to 0 if missing)
-    for (const h of handles) {
-      if (!(h in solvedMap)) solvedMap[h] = 0;
-    }
-
-    return solvedMap;
-  } catch (err) {
-    console.error(`getContestStandings error for contest ${contestId}:`, err.message);
-    return null;
+    // rows empty → fall through to fallback
+  } catch (e) {
+    console.error(`Standings API failed for ${contestId}:`, e.message);
+    // fall through to fallback
   }
+
+  // 2. Fallback: per‑member submissions (full history)
+  console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
+  let problemSet = new Set();
+  try {
+    const details = await getContestDetails(contestId);
+    if (details && details.problems) {
+      problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+    }
+  } catch (e) {
+    console.error('Failed to fetch contest details for fallback:', e.message);
+    // continue with empty problemSet (will count all accepted submissions in this contest)
+  }
+
+  const solvedMap = {};
+  // Initialize with 0 for all input handles
+  for (const h of handles) solvedMap[h] = 0;
+
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
+    const batchResults = await Promise.all(batch.map(async (handle) => {
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+          { timeout: 20000 }
+        );
+        const subs = res.data.result || [];
+        const solved = new Set();
+        for (const s of subs) {
+          if (s.verdict === "OK" && s.problem && s.problem.contestId == contestId) {
+            const idx = s.problem.index.toUpperCase();
+            if (problemSet.size === 0 || problemSet.has(idx)) {
+              solved.add(idx);
+            }
+          }
+        }
+        return { handle, count: solved.size };
+      } catch (e) {
+        console.error(`Failed to fetch submissions for ${handle}:`, e.message);
+        return { handle, count: 0 };
+      }
+    }));
+    for (const r of batchResults) {
+      solvedMap[r.handle] = r.count;
+    }
+    if (i + 2 < handles.length) await sleep(1500);
+  }
+  return solvedMap;
 }
 
 // ─── Weekly Leaderboard ──────────────────────────────────────────────────────
@@ -804,7 +852,10 @@ async function startBot() {
           if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
           const solvedMap = await getContestStandings(contest.id, handles);
-          if (!solvedMap) { await reply("❌ Failed to fetch standings. CF API may be down. Try again."); continue; }
+          if (!solvedMap) {
+            await reply(`❌ Could not fetch standings for contest ${contest.id}. Please try again later.`);
+            continue;
+          }
           const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
@@ -868,14 +919,12 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take a few seconds_`);
 
-          // Fetch standings using the handles parameter (fast)
           const solvedMap = await getContestStandings(contestId, handles);
           if (!solvedMap) {
             await reply(`❌ Could not fetch standings for contest ${contestId}. Please try again later.`);
             continue;
           }
 
-          // Get problem details (optional)
           const { problems } = await getContestDetails(contestId);
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
