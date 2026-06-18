@@ -987,7 +987,10 @@ async function startBot() {
           let contest = await getRunningContest();
           let isLive = !!contest;
           if (!contest) contest = await getRecentFinishedContest();
-          if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
+          if (!contest) {
+            await reply(`⚠️ Could not detect the latest contest automatically (CF API may be down).\nPlease use \`// contest <id>\` to check standings manually.`);
+            continue;
+          }
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
           const solvedMap = await getContestStandings(contest.id, handles, contest);
           if (!solvedMap) {
@@ -1043,8 +1046,9 @@ async function startBot() {
             continue;
           }
 
-          // Verify contest exists
           let contestInfo = null;
+
+          // Try to get contest info from contest.list first
           try {
             const list = await getCFContestList();
             const found = list.find(c => c.id == contestId);
@@ -1053,8 +1057,22 @@ async function startBot() {
             console.error("Error fetching contest list:", e.message);
           }
 
+          // Fallback: fetch contest details directly via contest.standings
           if (!contestInfo) {
-            await reply(`❌ Contest ${contestId} does not exist or is not a regular Codeforces round (gym contests not supported).`);
+            console.log(`🔄 Fallback: fetching contest ${contestId} directly via standings`);
+            try {
+              const details = await getContestDetails(contestId);
+              if (details && details.contest) {
+                contestInfo = details.contest;
+                console.log(`✅ Fallback succeeded for contest ${contestId}`);
+              }
+            } catch (e) {
+              console.error(`Fallback failed for contest ${contestId}:`, e.message);
+            }
+          }
+
+          if (!contestInfo) {
+            await reply(`❌ Could not fetch contest ${contestId}. Codeforces API may be down or contest does not exist.\nPlease try again later.`);
             continue;
           }
 
