@@ -118,7 +118,7 @@ const RATING_TO_POINTS = {
 };
 
 function calculatePointsForRating(rating) {
-  if (!rating) return 17; // Default 17 points for unrated problems
+  if (!rating) return 17;
   const rounded = Math.min(3000, Math.max(800, Math.round(rating / 100) * 100));
   return RATING_TO_POINTS[rounded] || 17;
 }
@@ -487,8 +487,6 @@ async function checkAndAnnounceWinner(sock) {
         const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
         text += `${medal} *${h}* — ${s} solved\n`;
       });
-      const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
-      if (notParticipated.length) text += `\n😴 Didn't participate: ${notParticipated.join(", ")}`;
       await sock.sendMessage(chatId, { text });
       await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
     } catch (e) { console.error(`Winner check error ${chatId}:`, e.message); }
@@ -574,7 +572,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
   let contestStart = 0;
   let contestEnd = Infinity;
 
-  // Get contest details if not provided
   if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
     contestStart = contestInfo.startTimeSeconds;
     contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
@@ -593,7 +590,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
     }
   }
 
-  // If we still don't have problem set, try to get it from the API again
   if (problemSet.size === 0) {
     try {
       const details = await getContestDetails(contestId);
@@ -620,7 +616,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
         const solved = new Set();
         for (const s of subs) {
           if (s.verdict === "OK" && s.problem && s.problem.contestId == contestId) {
-            // Time filter: only count if within contest duration
             const subTime = s.creationTimeSeconds;
             if (subTime >= contestStart && subTime <= contestEnd) {
               const idx = s.problem.index.toUpperCase();
@@ -912,12 +907,13 @@ async function startBot() {
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
           const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
-          const notParticipated = handles.filter((h) => !solvedMap[h] || solvedMap[h] === 0);
+
           let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
           text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
+
           if (!participated.length) {
             text += `😴 No group members have participated yet.`;
           } else {
@@ -925,7 +921,6 @@ async function startBot() {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
               text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
             });
-            if (notParticipated.length) text += `\n😴 Not participated: ${notParticipated.join(", ")}`;
           }
           await reply(text.trim());
         }
@@ -1009,37 +1004,29 @@ async function startBot() {
         // ── // whosolvedtoday ──────────────────────────────────────────
         else if (command.startsWith("// whosolvedtoday ")) {
           const url = body.slice(18).trim();
-          
           if (!url) {
             await reply("❌ Usage: `// whosolvedtoday <problem_url>`\nExample: `// whosolvedtoday https://codeforces.com/contest/1790/problem/D`");
             continue;
           }
-          
           const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
           if (!match) {
             await reply("❌ Invalid Codeforces problem URL.\nExamples:\n`https://codeforces.com/contest/1790/problem/D`\n`https://codeforces.com/problemset/problem/1790/D`");
             continue;
           }
-          
           const contestId = match[1];
           const problemIndex = match[2].toUpperCase();
           const handles = getAllHandles(groupData);
-          
           if (!handles.length) {
             await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
             continue;
           }
-          
           const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
           await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — may take ~${estimatedSeconds} seconds_`);
-          
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
           const todayIST = new Date(Date.now() + IST_OFFSET_MS);
           todayIST.setHours(0, 0, 0, 0);
           const todayStartIST = todayIST.getTime();
-          
           const solvedToday = [];
-          
           for (let i = 0; i < handles.length; i += 2) {
             const batch = handles.slice(i, i + 2);
             const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -1066,20 +1053,16 @@ async function startBot() {
                 return { handle, solved: false };
               }
             }));
-            
             for (const result of batchResults) {
               if (result.solved) {
                 solvedToday.push(result.handle);
               }
             }
-            
             if (i + 2 < handles.length) await sleep(1500);
           }
-          
           let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
           text += `📅 Today's Solves (IST)\n`;
           text += `${"─".repeat(28)}\n\n`;
-          
           if (solvedToday.length === 0) {
             text += `😴 No one solved this problem today.`;
           } else {
@@ -1088,7 +1071,6 @@ async function startBot() {
               text += `  ${i + 1}. *${h}*\n`;
             });
           }
-          
           text += `\n🔗 ${url}`;
           await reply(text.trim());
         }
