@@ -478,7 +478,6 @@ async function checkAndAnnounceWinner(sock) {
       if (now - finishedAt > 7200) { await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId }); continue; }
       const solvedMap = await getContestStandings(lastId, handles, lastContest);
       if (!solvedMap) continue;
-      // filter and sort using .solved
       const entries = Object.entries(solvedMap)
         .filter(([, data]) => data.solved > 0)
         .sort((a, b) => b[1].solved - a[1].solved);
@@ -533,7 +532,7 @@ async function getContestDetails(contestId) {
   }
 }
 
-// ─── getContestStandings with rank ──────────────────────────────────────────
+// ─── getContestStandings with fixes ──────────────────────────────────────────
 async function getContestStandings(contestId, handles, contestInfo) {
   if (!handles || handles.length === 0) return {};
 
@@ -542,18 +541,19 @@ async function getContestStandings(contestId, handles, contestInfo) {
     lowerToOriginal[h.toLowerCase()] = h;
   }
 
-  // Try official standings first
+  // 1. Try handles parameter (fast)
   try {
     const handlesStr = handles.join(';');
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesStr}&showUnofficial=true`;
     const res = await axios.get(url, { timeout: 25000 });
 
     if (res.data && res.data.result && res.data.result.rows && res.data.result.rows.length > 0) {
-      const rows = res.data.result.rows;
+      // Fix 1: Filter only CONTESTANT participants
+      const rows = res.data.result.rows.filter(
+        row => row.party.participantType === 'CONTESTANT'
+      );
       const solvedMap = {};
-      for (const h of handles) {
-        solvedMap[h] = { solved: 0, rank: null };
-      }
+      for (const h of handles) solvedMap[h] = { solved: 0, rank: null };
 
       for (const row of rows) {
         const memberHandles = row.party.members.map(m => m.handle);
@@ -570,18 +570,70 @@ async function getContestStandings(contestId, handles, contestInfo) {
           }
         }
       }
+      console.log(`✅ Handles API succeeded for ${contestId}:`, JSON.stringify(solvedMap, null, 2));
       return solvedMap;
     }
   } catch (e) {
-    console.error(`Standings API failed for ${contestId}:`, e.message);
+    console.error(`Handles API failed for ${contestId}:`, e.message);
   }
 
-  // Fallback: per‑member submissions (no rank)
-  console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
-  let problemSet = new Set();
+  // 2. Fallback: fetch full standings (reliable) – also filter CONTESTANT
+  console.log(`🔄 Fetching full standings for contest ${contestId}`);
+  try {
+    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`;
+    const res = await axios.get(url, { timeout: 30000 });
+
+    if (res.data && res.data.result && res.data.result.rows) {
+      const rows = res.data.result.rows.filter(
+        row => row.party.participantType === 'CONTESTANT'
+      );
+      const solvedMap = {};
+      for (const h of handles) solvedMap[h] = { solved: 0, rank: null };
+
+      const handleSet = new Set(handles.map(h => h.toLowerCase()));
+
+      for (const row of rows) {
+        const memberHandles = row.party.members.map(m => m.handle.toLowerCase());
+        let matched = false;
+        for (const mh of memberHandles) {
+          if (handleSet.has(mh)) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) continue;
+
+        const acceptedCount = row.problemResults.filter(
+          p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
+        ).length;
+        const rank = row.rank;
+
+        for (const mh of memberHandles) {
+          const original = lowerToOriginal[mh];
+          if (original) {
+            if (solvedMap[original].solved === 0) {
+              solvedMap[original].solved = acceptedCount;
+              solvedMap[original].rank = rank;
+            }
+          }
+        }
+      }
+      console.log(`✅ Full standings succeeded for ${contestId}:`, JSON.stringify(solvedMap, null, 2));
+      return solvedMap;
+    }
+  } catch (e) {
+    console.error(`Full standings fetch failed for ${contestId}:`, e.message);
+  }
+
+  // 3. Ultimate fallback: per‑member submissions (no rank initially)
+  console.log(`🔄 Ultimate fallback: per‑user submissions for contest ${contestId}`);
+
+  // Fix 2: Build valid problem keys (contestId-index) to handle paired contests
+  let problemKeys = new Set();
   let contestStart = 0;
   let contestEnd = Infinity;
 
+  // Get contest details if not provided
   if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
     contestStart = contestInfo.startTimeSeconds;
     contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
@@ -592,7 +644,9 @@ async function getContestStandings(contestId, handles, contestInfo) {
         contestStart = details.contest.startTimeSeconds || 0;
         contestEnd = contestStart + (details.contest.durationSeconds || 0);
         if (details.problems) {
-          problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+          for (const p of details.problems) {
+            problemKeys.add(`${contestId}-${p.index.toUpperCase()}`);
+          }
         }
       }
     } catch (e) {
@@ -600,22 +654,48 @@ async function getContestStandings(contestId, handles, contestInfo) {
     }
   }
 
-  if (problemSet.size === 0) {
+  // If problemKeys is still empty, try again directly
+  if (problemKeys.size === 0) {
     try {
       const details = await getContestDetails(contestId);
       if (details && details.problems) {
-        problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+        for (const p of details.problems) {
+          problemKeys.add(`${contestId}-${p.index.toUpperCase()}`);
+        }
       }
     } catch (e) {
       console.error('Failed to fetch problem set for fallback:', e.message);
     }
   }
 
+  // If still empty, we'll fall back to matching by contestId only
+  const useContestIdOnly = problemKeys.size === 0;
+
+  // Initialize solvedMap with 0 and null rank
   const solvedMap = {};
-  for (const h of handles) {
-    solvedMap[h] = { solved: 0, rank: null };
+  for (const h of handles) solvedMap[h] = { solved: 0, rank: null };
+
+  // Fix 3: Fetch official ranks from standings API (even if it failed earlier)
+  try {
+    const rankUrl = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handles.join(';')}&showUnofficial=false`;
+    const rankRes = await axios.get(rankUrl, { timeout: 15000 });
+    if (rankRes.data && rankRes.data.result && rankRes.data.result.rows) {
+      const rankRows = rankRes.data.result.rows.filter(
+        row => row.party.participantType === 'CONTESTANT'
+      );
+      for (const row of rankRows) {
+        const h = row.party.members[0]?.handle?.toLowerCase();
+        const original = lowerToOriginal[h];
+        if (original) {
+          solvedMap[original].rank = row.rank;
+        }
+      }
+    }
+  } catch (_) {
+    // Ignore rank fetch errors – rank stays null
   }
 
+  // Now do the submission scan to get solve counts
   for (let i = 0; i < handles.length; i += 2) {
     const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -627,12 +707,20 @@ async function getContestStandings(contestId, handles, contestInfo) {
         const subs = res.data.result || [];
         const solved = new Set();
         for (const s of subs) {
-          if (s.verdict === "OK" && s.problem && s.problem.contestId == contestId) {
+          if (s.verdict === "OK" && s.problem) {
             const subTime = s.creationTimeSeconds;
             if (subTime >= contestStart && subTime <= contestEnd) {
-              const idx = s.problem.index.toUpperCase();
-              if (problemSet.size === 0 || problemSet.has(idx)) {
-                solved.add(idx);
+              if (useContestIdOnly) {
+                // Fallback to only contestId match
+                if (Number(s.problem.contestId) === Number(contestId)) {
+                  solved.add(s.problem.index.toUpperCase());
+                }
+              } else {
+                // Check against problemKeys
+                const key = `${s.problem.contestId}-${s.problem.index.toUpperCase()}`;
+                if (problemKeys.has(key)) {
+                  solved.add(key);
+                }
               }
             }
           }
@@ -645,10 +733,11 @@ async function getContestStandings(contestId, handles, contestInfo) {
     }));
     for (const r of batchResults) {
       solvedMap[r.handle].solved = r.count;
-      // rank stays null
     }
     if (i + 2 < handles.length) await sleep(1500);
   }
+
+  console.log(`✅ Ultimate fallback succeeded for ${contestId}:`, JSON.stringify(solvedMap, null, 2));
   return solvedMap;
 }
 
