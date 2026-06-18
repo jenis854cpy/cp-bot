@@ -478,14 +478,20 @@ async function checkAndAnnounceWinner(sock) {
       if (now - finishedAt > 7200) { await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId }); continue; }
       const solvedMap = await getContestStandings(lastId, handles, lastContest);
       if (!solvedMap) continue;
-      const entries = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+      // filter and sort using .solved
+      const entries = Object.entries(solvedMap)
+        .filter(([, data]) => data.solved > 0)
+        .sort((a, b) => b[1].solved - a[1].solved);
       if (!entries.length) continue;
-      const [winner, winnerSolved] = entries[0];
+      const [winner, winnerData] = entries[0];
+      const winnerSolved = winnerData.solved;
+      const winnerRank = winnerData.rank;
       let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
-      text += `🏆 *Group Winner: ${winner}* with *${winnerSolved}* solved!\n\n📊 *Group Performance:*\n`;
-      entries.forEach(([h, s], i) => {
+      text += `🏆 *Group Winner: ${winner}* with *${winnerSolved}* solved${winnerRank ? ` (Rank #${winnerRank})` : ''}!\n\n📊 *Group Performance:*\n`;
+      entries.forEach(([h, data], i) => {
         const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-        text += `${medal} *${h}* — ${s} solved\n`;
+        const rankStr = data.rank ? ` | Rank #${data.rank}` : '';
+        text += `${medal} *${h}* — ✅ ${data.solved} solved${rankStr}\n`;
       });
       await sock.sendMessage(chatId, { text });
       await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
@@ -527,7 +533,7 @@ async function getContestDetails(contestId) {
   }
 }
 
-// ─── getContestStandings with time filter in fallback ───────────────────────
+// ─── getContestStandings with rank ──────────────────────────────────────────
 async function getContestStandings(contestId, handles, contestInfo) {
   if (!handles || handles.length === 0) return {};
 
@@ -545,18 +551,22 @@ async function getContestStandings(contestId, handles, contestInfo) {
     if (res.data && res.data.result && res.data.result.rows && res.data.result.rows.length > 0) {
       const rows = res.data.result.rows;
       const solvedMap = {};
-      for (const h of handles) solvedMap[h] = 0;
+      for (const h of handles) {
+        solvedMap[h] = { solved: 0, rank: null };
+      }
 
       for (const row of rows) {
         const memberHandles = row.party.members.map(m => m.handle);
         const acceptedCount = row.problemResults.filter(
           p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
         ).length;
+        const rank = row.rank;
         for (const apiHandle of memberHandles) {
           const lower = apiHandle.toLowerCase();
           const original = lowerToOriginal[lower];
           if (original) {
-            solvedMap[original] = acceptedCount;
+            solvedMap[original].solved = acceptedCount;
+            solvedMap[original].rank = rank;
           }
         }
       }
@@ -566,7 +576,7 @@ async function getContestStandings(contestId, handles, contestInfo) {
     console.error(`Standings API failed for ${contestId}:`, e.message);
   }
 
-  // Fallback: per‑member submissions, with time filtering
+  // Fallback: per‑member submissions (no rank)
   console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
   let problemSet = new Set();
   let contestStart = 0;
@@ -602,7 +612,9 @@ async function getContestStandings(contestId, handles, contestInfo) {
   }
 
   const solvedMap = {};
-  for (const h of handles) solvedMap[h] = 0;
+  for (const h of handles) {
+    solvedMap[h] = { solved: 0, rank: null };
+  }
 
   for (let i = 0; i < handles.length; i += 2) {
     const batch = handles.slice(i, i + 2);
@@ -632,7 +644,8 @@ async function getContestStandings(contestId, handles, contestInfo) {
       }
     }));
     for (const r of batchResults) {
-      solvedMap[r.handle] = r.count;
+      solvedMap[r.handle].solved = r.count;
+      // rank stays null
     }
     if (i + 2 < handles.length) await sleep(1500);
   }
@@ -906,7 +919,9 @@ async function startBot() {
           const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
-          const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+          const participated = Object.entries(solvedMap)
+            .filter(([, data]) => data.solved > 0)
+            .sort((a, b) => b[1].solved - a[1].solved);
 
           let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
@@ -917,9 +932,10 @@ async function startBot() {
           if (!participated.length) {
             text += `😴 No group members have participated yet.`;
           } else {
-            participated.forEach(([h, s], i) => {
+            participated.forEach(([h, data], i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
+              const rankStr = data.rank ? ` | Rank #${data.rank}` : '';
+              text += `${medal} *${h}* — ✅ ${data.solved}${totalProblems ? `/${totalProblems}` : ''} solved${rankStr}\n`;
             });
           }
           await reply(text.trim());
@@ -975,7 +991,9 @@ async function startBot() {
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
 
-          const participated = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+          const participated = Object.entries(solvedMap)
+            .filter(([, data]) => data.solved > 0)
+            .sort((a, b) => b[1].solved - a[1].solved);
 
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
@@ -992,9 +1010,10 @@ async function startBot() {
           if (!participated.length) {
             text += `😴 No group members participated in this contest.`;
           } else {
-            participated.forEach(([h, s], i) => {
+            participated.forEach(([h, data], i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${h}* — ✅ ${s}${totalProblems ? `/${totalProblems}` : ""} solved\n`;
+              const rankStr = data.rank ? ` | Rank #${data.rank}` : '';
+              text += `${medal} *${h}* — ✅ ${data.solved}${totalProblems ? `/${totalProblems}` : ''} solved${rankStr}\n`;
             });
           }
           text += `\n🔗 https://codeforces.com/contest/${contestId}`;
