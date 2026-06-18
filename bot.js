@@ -480,7 +480,15 @@ async function checkAndAnnounceWinner(sock) {
       if (!solvedMap) continue;
       const entries = Object.entries(solvedMap)
         .filter(([, data]) => data.solved > 0)
-        .sort((a, b) => b[1].solved - a[1].solved);
+        .sort((a, b) => {
+          if (b[1].solved !== a[1].solved) return b[1].solved - a[1].solved;
+          const aRank = a[1].rank;
+          const bRank = b[1].rank;
+          if (aRank !== null && bRank !== null) return aRank - bRank;
+          if (aRank !== null) return -1;
+          if (bRank !== null) return 1;
+          return a[0].localeCompare(b[0]);
+        });
       if (!entries.length) continue;
       const [winner, winnerData] = entries[0];
       const winnerSolved = winnerData.solved;
@@ -999,7 +1007,15 @@ async function startBot() {
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
           const participated = Object.entries(solvedMap)
             .filter(([, data]) => data.solved > 0)
-            .sort((a, b) => b[1].solved - a[1].solved);
+            .sort((a, b) => {
+              if (b[1].solved !== a[1].solved) return b[1].solved - a[1].solved;
+              const aRank = a[1].rank;
+              const bRank = b[1].rank;
+              if (aRank !== null && bRank !== null) return aRank - bRank;
+              if (aRank !== null) return -1;
+              if (bRank !== null) return 1;
+              return a[0].localeCompare(b[0]);
+            });
 
           let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
@@ -1071,7 +1087,15 @@ async function startBot() {
 
           const participated = Object.entries(solvedMap)
             .filter(([, data]) => data.solved > 0)
-            .sort((a, b) => b[1].solved - a[1].solved);
+            .sort((a, b) => {
+              if (b[1].solved !== a[1].solved) return b[1].solved - a[1].solved;
+              const aRank = a[1].rank;
+              const bRank = b[1].rank;
+              if (aRank !== null && bRank !== null) return aRank - bRank;
+              if (aRank !== null) return -1;
+              if (bRank !== null) return 1;
+              return a[0].localeCompare(b[0]);
+            });
 
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
