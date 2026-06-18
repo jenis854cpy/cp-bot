@@ -502,23 +502,27 @@ async function getContestStandings(contestId, handles, contestInfo) {
     ratingChangesPromise,
   ]);
 
-  // Process standings (always try even if rejected)
+  // Process standings (if successful)
+  let standingsWorked = false;
   if (standingsResult.status === 'fulfilled') {
     const standingsData = standingsResult.value.data;
     if (standingsData && standingsData.status === 'OK' && standingsData.result && standingsData.result.rows) {
       const rows = standingsData.result.rows.filter(
         row => row.party.participantType === 'CONTESTANT'
       );
-      for (const row of rows) {
-        const memberHandles = row.party.members.map(m => m.handle);
-        const acceptedCount = row.problemResults.filter(
-          p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
-        ).length;
-        for (const apiHandle of memberHandles) {
-          const lower = apiHandle.toLowerCase();
-          const original = lowerToOriginal[lower];
-          if (original) {
-            solvedMap[original].solved = acceptedCount;
+      if (rows.length > 0) {
+        standingsWorked = true;
+        for (const row of rows) {
+          const memberHandles = row.party.members.map(m => m.handle);
+          const acceptedCount = row.problemResults.filter(
+            p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
+          ).length;
+          for (const apiHandle of memberHandles) {
+            const lower = apiHandle.toLowerCase();
+            const original = lowerToOriginal[lower];
+            if (original) {
+              solvedMap[original].solved = acceptedCount;
+            }
           }
         }
       }
@@ -545,20 +549,32 @@ async function getContestStandings(contestId, handles, contestInfo) {
     console.log(`No rating changes for contest ${contestId} (unrated or unavailable)`);
   }
 
-  // Check if standings failed entirely – if so, fallback to per‑member submissions for solves
-  const allZero = Object.values(solvedMap).every(v => v.solved === 0);
-  if (allZero) {
-    console.log(`🔄 Standings gave zero for all; falling back to per‑user submissions for contest ${contestId}`);
-    // Get contest start and end times
-    let contestStart = 0, contestEnd = Infinity;
-    try {
-      const details = await getContestDetails(contestId);
-      if (details && details.contest) {
-        contestStart = details.contest.startTimeSeconds || 0;
-        contestEnd = contestStart + (details.contest.durationSeconds || 0);
-      }
-    } catch (_) {}
+  // If standings didn't work, fallback to per‑member submissions with time filtering
+  if (!standingsWorked) {
+    console.log(`🔄 Standings API failed or returned no rows; falling back to per‑user submissions for contest ${contestId}`);
 
+    // Get contest start and end times from contestInfo or fetch
+    let contestStart = 0, contestEnd = Infinity;
+    if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
+      contestStart = contestInfo.startTimeSeconds;
+      contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
+    } else {
+      try {
+        const details = await getContestDetails(contestId);
+        if (details && details.contest) {
+          contestStart = details.contest.startTimeSeconds || 0;
+          contestEnd = contestStart + (details.contest.durationSeconds || 0);
+        }
+      } catch (_) {}
+    }
+
+    // If we still don't have contest times, we cannot safely filter; return what we have (solves will be 0)
+    if (contestStart === 0 && contestEnd === Infinity) {
+      console.warn(`Could not determine contest time for ${contestId}; fallback will not count any submissions.`);
+      return solvedMap;
+    }
+
+    // Get problem keys for validation
     let problemKeys = new Set();
     try {
       const details = await getContestDetails(contestId);
