@@ -118,10 +118,9 @@ const RATING_TO_POINTS = {
 };
 
 function calculatePointsForRating(rating) {
-  if (!rating) return 0;
-  // Round to nearest 100 within 800-3000 range
+  if (!rating) return 17; // Default 17 points for unrated problems
   const rounded = Math.min(3000, Math.max(800, Math.round(rating / 100) * 100));
-  return RATING_TO_POINTS[rounded] || 0;
+  return RATING_TO_POINTS[rounded] || 17;
 }
 
 // ─── Codeforces API ───────────────────────────────────────────────────────────
@@ -1166,7 +1165,7 @@ async function startBot() {
           const results = await getWeeklyLeaderboard(handles);
           const active = results.filter((r) => r.points > 0);
 
-          let text = `🏅 *Weekly Leaderboard (Points)*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
+          let text = `🏅 *Weekly Leaderboard*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
 
           if (!active.length) {
             text += `😴 No one solved any problems this week!\nStart grinding! 💪`;
@@ -1175,8 +1174,6 @@ async function startBot() {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
               text += `${medal} *${r.handle}* — ${r.points} pts (${r.count} problem${r.count>1?'s':''})\n`;
             });
-            const inactive = results.filter((r) => r.points === 0);
-            if (inactive.length) text += `\n😴 No activity: ${inactive.map(r => r.handle).join(", ")}`;
           }
 
           await reply(text.trim());
@@ -1199,7 +1196,7 @@ async function startBot() {
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
-            `🏅 \`// leaderboard week\`\n    Who scored most points this week (based on problem rating)\n\n` +
+            `🏅 \`// leaderboard week\`\n    Weekly performance ranking\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every CF contest!*\n` +
             `📢 *Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!*`
