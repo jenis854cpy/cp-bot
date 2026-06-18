@@ -476,7 +476,7 @@ async function checkAndAnnounceWinner(sock) {
       const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
       const now = Math.floor(Date.now() / 1000);
       if (now - finishedAt > 7200) { await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId }); continue; }
-      const solvedMap = await getContestStandings(lastId, handles);
+      const solvedMap = await getContestStandings(lastId, handles, lastContest);
       if (!solvedMap) continue;
       const entries = Object.entries(solvedMap).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
       if (!entries.length) continue;
@@ -529,7 +529,8 @@ async function getContestDetails(contestId) {
   }
 }
 
-async function getContestStandings(contestId, handles) {
+// ─── getContestStandings with time filter in fallback ───────────────────────
+async function getContestStandings(contestId, handles, contestInfo) {
   if (!handles || handles.length === 0) return {};
 
   const lowerToOriginal = {};
@@ -537,6 +538,7 @@ async function getContestStandings(contestId, handles) {
     lowerToOriginal[h.toLowerCase()] = h;
   }
 
+  // Try official standings first
   try {
     const handlesStr = handles.join(';');
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesStr}&showUnofficial=true`;
@@ -566,15 +568,41 @@ async function getContestStandings(contestId, handles) {
     console.error(`Standings API failed for ${contestId}:`, e.message);
   }
 
+  // Fallback: per‑member submissions, with time filtering
   console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
   let problemSet = new Set();
-  try {
-    const details = await getContestDetails(contestId);
-    if (details && details.problems) {
-      problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+  let contestStart = 0;
+  let contestEnd = Infinity;
+
+  // Get contest details if not provided
+  if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
+    contestStart = contestInfo.startTimeSeconds;
+    contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
+  } else {
+    try {
+      const details = await getContestDetails(contestId);
+      if (details && details.contest) {
+        contestStart = details.contest.startTimeSeconds || 0;
+        contestEnd = contestStart + (details.contest.durationSeconds || 0);
+        if (details.problems) {
+          problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch contest details for fallback:', e.message);
     }
-  } catch (e) {
-    console.error('Failed to fetch contest details for fallback:', e.message);
+  }
+
+  // If we still don't have problem set, try to get it from the API again
+  if (problemSet.size === 0) {
+    try {
+      const details = await getContestDetails(contestId);
+      if (details && details.problems) {
+        problemSet = new Set(details.problems.map(p => p.index.toUpperCase()));
+      }
+    } catch (e) {
+      console.error('Failed to fetch problem set for fallback:', e.message);
+    }
   }
 
   const solvedMap = {};
@@ -592,9 +620,13 @@ async function getContestStandings(contestId, handles) {
         const solved = new Set();
         for (const s of subs) {
           if (s.verdict === "OK" && s.problem && s.problem.contestId == contestId) {
-            const idx = s.problem.index.toUpperCase();
-            if (problemSet.size === 0 || problemSet.has(idx)) {
-              solved.add(idx);
+            // Time filter: only count if within contest duration
+            const subTime = s.creationTimeSeconds;
+            if (subTime >= contestStart && subTime <= contestEnd) {
+              const idx = s.problem.index.toUpperCase();
+              if (problemSet.size === 0 || problemSet.has(idx)) {
+                solved.add(idx);
+              }
             }
           }
         }
@@ -871,7 +903,7 @@ async function startBot() {
           if (!contest) contest = await getRecentFinishedContest();
           if (!contest) { await reply("❌ No active or recent contest found on Codeforces."); continue; }
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
-          const solvedMap = await getContestStandings(contest.id, handles);
+          const solvedMap = await getContestStandings(contest.id, handles, contest);
           if (!solvedMap) {
             await reply(`❌ Could not fetch standings for contest ${contest.id}. Please try again later.`);
             continue;
@@ -938,7 +970,7 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take a few seconds_`);
 
-          const solvedMap = await getContestStandings(contestId, handles);
+          const solvedMap = await getContestStandings(contestId, handles, contestInfo);
           if (!solvedMap) {
             await reply(`❌ Could not fetch standings for contest ${contestId}. Please try again later.`);
             continue;
@@ -1203,7 +1235,7 @@ async function startBot() {
             `🏷 *[ 03 ]  CONTESTS*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `📅 \`// upcoming\`\n   _Next CF, LC & CC contests_\n\n` +
-            `🧩 \`// solved\`\n   _Who solved what in current contest_\n\n` +
+            `🧩 \`// solved\`\n   _Who solved what in last contest_\n\n` +
             `🏁 \`// contest <id>\`\n   _Group standings for any contest_\n   _eg. // contest 1790_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 04 ]  DAILY TRACKING*\n` +
