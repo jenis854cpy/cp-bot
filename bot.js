@@ -376,7 +376,7 @@ async function getLeetCodeUpcoming() {
   } catch { return []; }
 }
 
-// ─── Unified Reminder System ─────────────────────────────────────────────────
+// ─── Reminder System with fixes ──────────────────────────────────────────────
 async function checkAndSendReminders(sock) {
   try {
     const [cf, cc, lc] = await Promise.all([
@@ -386,6 +386,8 @@ async function checkAndSendReminders(sock) {
     ]);
     const allContests = [...cf, ...cc, ...lc];
     if (!allContests.length) return;
+
+    console.log(`🔍 Checking ${allContests.length} upcoming contests...`);
 
     const now = Math.floor(Date.now() / 1000);
     const groups = await CFData.find({}).lean();
@@ -402,17 +404,22 @@ async function checkAndSendReminders(sock) {
 
       for (const contest of allContests) {
         const diff = contest.startTimeSeconds - now;
+        const minsLeft = Math.round(diff / 60);
+        console.log(`⏰ ${contest.name}: ${minsLeft} min left`);
+
+        // 1-day reminder: 23.5–24.5 hours
         if (diff >= 23.5 * 3600 && diff <= 24.5 * 3600) {
           if (!reminders[contest.id]?.daySent) {
             await sendReminder(sock, chatId, contest, "day");
-            reminders[contest.id] = reminders[contest.id] || {};
+            if (!reminders[contest.id]) reminders[contest.id] = {};
             reminders[contest.id].daySent = true;
           }
         }
-        if (diff >= 45 * 60 && diff <= 75 * 60) {
+        // 1-hour reminder: 30–90 minutes (wider window)
+        if (diff >= 30 * 60 && diff <= 90 * 60) {
           if (!reminders[contest.id]?.hourSent) {
             await sendReminder(sock, chatId, contest, "hour");
-            reminders[contest.id] = reminders[contest.id] || {};
+            if (!reminders[contest.id]) reminders[contest.id] = {};
             reminders[contest.id].hourSent = true;
           }
         }
@@ -831,9 +838,15 @@ async function startBot() {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
 
+      // ─── Start reminder interval ──────────────────────────────────────
+      console.log("✅ Reminder interval started");
       setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
+
+      // ─── Winner checker ──────────────────────────────────────────────
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
+
+      // ─── Startup grace check for reminders (missed contests) ──────
       setTimeout(() => checkAndSendReminders(sock), 30 * 1000);
     }
   });
