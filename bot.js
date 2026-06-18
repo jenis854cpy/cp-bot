@@ -466,20 +466,31 @@ async function sendReminder(sock, chatId, contest, type) {
   }
 }
 
-// ─── Sorting comparator ──────────────────────────────────────────────────────
+// ─── Sorting comparator with penalty ────────────────────────────────────────
 function compareContestEntries(a, b) {
   const aData = a[1];
   const bData = b[1];
+
+  // 1. Solved count descending
   if (bData.solved !== aData.solved) return bData.solved - aData.solved;
+
+  // 2. Rank ascending (only if both have rank – for rated finished contests)
   const aRank = aData.rank;
   const bRank = bData.rank;
   if (aRank !== null && bRank !== null) return aRank - bRank;
   if (aRank !== null) return -1;
   if (bRank !== null) return 1;
+
+  // 3. Penalty ascending (live contests or unrated)
+  const aPenalty = aData.penalty ?? Infinity;
+  const bPenalty = bData.penalty ?? Infinity;
+  if (aPenalty !== bPenalty) return aPenalty - bPenalty;
+
+  // 4. Alphabetical tiebreaker
   return a[0].localeCompare(b[0]);
 }
 
-// ─── getContestStandings (using Promise.allSettled) ──────────────────────────
+// ─── getContestStandings (extracts penalty, uses Promise.allSettled) ─────────
 async function getContestStandings(contestId, handles, contestInfo) {
   if (!handles || handles.length === 0) return {};
 
@@ -488,10 +499,10 @@ async function getContestStandings(contestId, handles, contestInfo) {
     lowerToOriginal[h.toLowerCase()] = h;
   }
 
-  // Initialize map
+  // Initialize map with penalty: 0
   const solvedMap = {};
   for (const h of handles) {
-    solvedMap[h] = { solved: 0, rank: null };
+    solvedMap[h] = { solved: 0, rank: null, penalty: 0 };
   }
 
   // Parallel API calls with Promise.allSettled
@@ -509,7 +520,7 @@ async function getContestStandings(contestId, handles, contestInfo) {
     ratingChangesPromise,
   ]);
 
-  // Process standings (if successful)
+  // Process standings (if successful) – extract solves, rank, and penalty
   let standingsWorked = false;
   if (standingsResult.status === 'fulfilled') {
     const standingsData = standingsResult.value.data;
@@ -524,11 +535,15 @@ async function getContestStandings(contestId, handles, contestInfo) {
           const acceptedCount = row.problemResults.filter(
             p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
           ).length;
+          const rank = row.rank;
+          const penalty = row.penalty || 0;
           for (const apiHandle of memberHandles) {
             const lower = apiHandle.toLowerCase();
             const original = lowerToOriginal[lower];
             if (original) {
               solvedMap[original].solved = acceptedCount;
+              solvedMap[original].rank = rank;
+              solvedMap[original].penalty = penalty;
             }
           }
         }
@@ -627,6 +642,7 @@ async function getContestStandings(contestId, handles, contestInfo) {
       for (const r of batchResults) {
         if (solvedMap[r.handle]) {
           solvedMap[r.handle].solved = r.count;
+          // In fallback we have no penalty; keep 0
         }
       }
       if (i + 2 < handles.length) await sleep(1500);
