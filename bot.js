@@ -548,7 +548,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
     const res = await axios.get(url, { timeout: 25000 });
 
     if (res.data && res.data.result && res.data.result.rows && res.data.result.rows.length > 0) {
-      // Fix 1: Filter only CONTESTANT participants
       const rows = res.data.result.rows.filter(
         row => row.party.participantType === 'CONTESTANT'
       );
@@ -577,7 +576,7 @@ async function getContestStandings(contestId, handles, contestInfo) {
     console.error(`Handles API failed for ${contestId}:`, e.message);
   }
 
-  // 2. Fallback: fetch full standings (reliable) – also filter CONTESTANT
+  // 2. Fallback: fetch full standings (reliable)
   console.log(`🔄 Fetching full standings for contest ${contestId}`);
   try {
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&showUnofficial=true`;
@@ -625,15 +624,13 @@ async function getContestStandings(contestId, handles, contestInfo) {
     console.error(`Full standings fetch failed for ${contestId}:`, e.message);
   }
 
-  // 3. Ultimate fallback: per‑member submissions (no rank initially)
+  // 3. Ultimate fallback: per‑member submissions
   console.log(`🔄 Ultimate fallback: per‑user submissions for contest ${contestId}`);
 
-  // Fix 2: Build valid problem keys (contestId-index) to handle paired contests
   let problemKeys = new Set();
   let contestStart = 0;
   let contestEnd = Infinity;
 
-  // Get contest details if not provided
   if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
     contestStart = contestInfo.startTimeSeconds;
     contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
@@ -654,7 +651,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
     }
   }
 
-  // If problemKeys is still empty, try again directly
   if (problemKeys.size === 0) {
     try {
       const details = await getContestDetails(contestId);
@@ -668,14 +664,12 @@ async function getContestStandings(contestId, handles, contestInfo) {
     }
   }
 
-  // If still empty, we'll fall back to matching by contestId only
   const useContestIdOnly = problemKeys.size === 0;
 
-  // Initialize solvedMap with 0 and null rank
   const solvedMap = {};
   for (const h of handles) solvedMap[h] = { solved: 0, rank: null };
 
-  // Fix 3: Fetch official ranks from standings API (even if it failed earlier)
+  // Fetch ranks even in fallback
   try {
     const rankUrl = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handles.join(';')}&showUnofficial=false`;
     const rankRes = await axios.get(rankUrl, { timeout: 15000 });
@@ -691,11 +685,8 @@ async function getContestStandings(contestId, handles, contestInfo) {
         }
       }
     }
-  } catch (_) {
-    // Ignore rank fetch errors – rank stays null
-  }
+  } catch (_) {}
 
-  // Now do the submission scan to get solve counts
   for (let i = 0; i < handles.length; i += 2) {
     const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -711,12 +702,10 @@ async function getContestStandings(contestId, handles, contestInfo) {
             const subTime = s.creationTimeSeconds;
             if (subTime >= contestStart && subTime <= contestEnd) {
               if (useContestIdOnly) {
-                // Fallback to only contestId match
                 if (Number(s.problem.contestId) === Number(contestId)) {
                   solved.add(s.problem.index.toUpperCase());
                 }
               } else {
-                // Check against problemKeys
                 const key = `${s.problem.contestId}-${s.problem.index.toUpperCase()}`;
                 if (problemKeys.has(key)) {
                   solved.add(key);
