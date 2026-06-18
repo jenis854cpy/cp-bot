@@ -612,8 +612,8 @@ async function getContestStandings(contestId, handles) {
   return solvedMap;
 }
 
-// ─── Weekly Leaderboard (points‑based) ──────────────────────────────────────
-async function getWeeklyLeaderboard(handles) {
+// ─── Delta7 (weekly leaderboard with points) ─────────────────────────────────
+async function getDelta7(handles) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const nowIST = Date.now() + IST_OFFSET_MS;
   const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
@@ -1155,17 +1155,17 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // leaderboard week ──────────────────────────────────────────
-        else if (command === "// leaderboard week") {
+        // ── // delta7 ──────────────────────────────────────────────────
+        else if (command === "// delta7") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
           const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
           await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
 
-          const results = await getWeeklyLeaderboard(handles);
+          const results = await getDelta7(handles);
           const active = results.filter((r) => r.points > 0);
 
-          let text = `🏅 *Weekly Leaderboard*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
+          let text = `📈 *Delta7 (Last 7 Days)*\n${"─".repeat(28)}\n📅 Rolling 7-day points\n\n`;
 
           if (!active.length) {
             text += `😴 No one solved any problems this week!\nStart grinding! 💪`;
@@ -1182,30 +1182,45 @@ async function startBot() {
         // ── // help ──────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
-            `🤖 *CF Group Bot — Commands*\n\n` +
-            `👤 *Handle Management*\n` +
-            `➕ \`// add <cf_id>\`\n    Register your CF handle\n` +
-            `➕ \`// add h1 h2 h3\`\n    Add multiple handles at once\n` +
-            `❌ \`// remove\`\n    Remove all your handles\n` +
-            `❌ \`// remove <cf_id>\`\n    Remove one specific handle\n\n` +
-            `🏆 *Leaderboards & Stats*\n` +
-            `🏆 \`// rating\`\n    Group leaderboard by rating\n` +
-            `🏅 \`// leaderboard week\`\n    Who scored most points this week (Delta7)\n` +
-            `👤 \`// myrating\`\n    Your own CF rating & rank\n` +
-            `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n` +
-            `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n` +
-            `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
-            `⚔️ *Contests & Live Insights*\n` +
-            `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n` +
-            `📊 \`// solved\`\n    Who solved what in latest contest\n` +
-            `📋 \`// contest <id_or_url>\`\n    Show standings for a specific contest\n    Example: \`// contest 1790\`\n\n` +
-            `📅 *Daily Tracking*\n` +
-            `📅 \`// whosolvedtoday <problem_url>\`\n    Check who solved a problem today (IST)\n    Example: \`// whosolvedtoday https://codeforces.com/contest/1790/problem/D\`\n\n` +
-            `❓ *System*\n` +
-            `❓ \`// help\`\n    Show this command list\n\n` +
-            `==============================\n` +
-            `🏁 Auto-announces group winner after every CF contest!\n` +
-            `📢 Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!`
+            `⚡ *CF GROUP BOT* ⚡\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `🏷 *[ 01 ]  HANDLE MANAGEMENT*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `➕ \`// add <cf_id>\`\n   _Register your CF handle_\n\n` +
+            `➕ \`// add h1 h2 h3\`\n   _Add multiple handles at once_\n\n` +
+            `➖ \`// remove\`\n   _Delete all your handles_\n\n` +
+            `➖ \`// remove <cf_id>\`\n   _Delete a specific handle_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `🏷 *[ 02 ]  LEADERBOARDS & STATS*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `📊 \`// rating\`\n   _Group ranking by CF rating_\n\n` +
+            `📈 \`// delta7\`\n   _Rolling 7-day points (Δ7)_\n\n` +
+            `🎯 \`// myrating\`\n   _Your current rating & rank_\n\n` +
+            `🔥 \`// streak <cf_id>\`\n   _Current & max daily streak_\n\n` +
+            `🧠 \`// info <cf_id>\`\n   _Full profile & solve stats_\n\n` +
+            `⚔️ \`// compare <id1> <id2>\`\n   _Head-to-head comparison_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `🏷 *[ 03 ]  CONTESTS*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `📅 \`// upcoming\`\n   _Next CF, LC & CC contests_\n\n` +
+            `🧩 \`// solved\`\n   _Who solved what in current contest_\n\n` +
+            `🏁 \`// contest <id>\`\n   _Group standings for any contest_\n   _eg. // contest 1790_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `🏷 *[ 04 ]  DAILY TRACKING*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `✅ \`// whosolvedtoday <url>\`\n   _Who solved a problem today (IST)_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `🏷 *[ 05 ]  HELP*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `📖 \`// help\`\n   _Show this menu anytime_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
+            `✦ *AUTO FEATURES*\n` +
+            `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `🥇 *Winner Alert*\n   _Announced live right after_\n   _every CF contest — automatic!_\n\n` +
+            `⏰ *Contest Reminder*\n   _Auto sent 24h & 1h before_\n   _every contest. Never miss one!_\n\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n` +
+            `✦  *Code hard. Rank higher.* 🚀\n` +
+            `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰`
           );
         }
 
