@@ -497,7 +497,7 @@ async function sendReminder(sock, chatId, contest, type) {
   }
 }
 
-// ─── Sorting comparator (corrected) ─────────────────────────────────────────
+// ─── Sorting comparator ──────────────────────────────────────────────────────
 function compareContestEntries(a, b) {
   const aData = a[1];
   const bData = b[1];
@@ -519,7 +519,7 @@ function compareContestEntries(a, b) {
   return a[0].localeCompare(b[0]);
 }
 
-// ─── getContestStandings (extracts penalty, uses Promise.allSettled) ─────────
+// ─── getContestStandings (rank from standings is primary, never overwritten) ──
 async function getContestStandings(contestId, handles, contestInfo) {
   if (!handles || handles.length === 0) return {};
 
@@ -528,33 +528,22 @@ async function getContestStandings(contestId, handles, contestInfo) {
     lowerToOriginal[h.toLowerCase()] = h;
   }
 
-  // Initialize map with penalty: 0
+  // Initialize map with rank: null, penalty: 0
   const solvedMap = {};
   for (const h of handles) {
     solvedMap[h] = { solved: 0, rank: null, penalty: 0 };
   }
 
-  // Parallel API calls with Promise.allSettled
-  const standingsPromise = axios.get(
-    `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handles.join(';')}&showUnofficial=false`,
-    { timeout: 30000 }
-  );
-  const ratingChangesPromise = axios.get(
-    `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
-    { timeout: 30000 }
-  );
-
-  const [standingsResult, ratingChangesResult] = await Promise.allSettled([
-    standingsPromise,
-    ratingChangesPromise,
-  ]);
-
-  // Process standings (if successful) – extract solves, rank, and penalty
   let standingsWorked = false;
-  if (standingsResult.status === 'fulfilled') {
-    const standingsData = standingsResult.value.data;
-    if (standingsData && standingsData.status === 'OK' && standingsData.result && standingsData.result.rows) {
-      const rows = standingsData.result.rows.filter(
+
+  // ─── PRIMARY: contest.standings (rank is reliable, available immediately) ──
+  try {
+    const res = await axios.get(
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handles.join(';')}&showUnofficial=false`,
+      { timeout: 30000 }
+    );
+    if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.rows) {
+      const rows = res.data.result.rows.filter(
         row => row.party.participantType === 'CONTESTANT'
       );
       if (rows.length > 0) {
@@ -564,47 +553,53 @@ async function getContestStandings(contestId, handles, contestInfo) {
           const acceptedCount = row.problemResults.filter(
             p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
           ).length;
-          const rank = row.rank;
+          const rank = row.rank || null;
           const penalty = row.penalty || 0;
           for (const apiHandle of memberHandles) {
             const lower = apiHandle.toLowerCase();
             const original = lowerToOriginal[lower];
             if (original) {
               solvedMap[original].solved = acceptedCount;
-              solvedMap[original].rank = rank;
+              solvedMap[original].rank = rank;          // ← rank from standings
               solvedMap[original].penalty = penalty;
             }
           }
         }
       }
     }
-  } else {
-    console.error(`Standings fetch failed for ${contestId}:`, standingsResult.reason?.message || 'Unknown error');
+  } catch (e) {
+    console.error(`Standings fetch failed for ${contestId}:`, e.message);
   }
 
-  // Process ratingChanges (if successful)
-  if (ratingChangesResult.status === 'fulfilled') {
-    const ratingData = ratingChangesResult.value.data;
-    if (ratingData && ratingData.status === 'OK' && ratingData.result) {
-      for (const change of ratingData.result) {
-        const handle = change.handle;
-        const rank = change.rank;
-        const lower = handle.toLowerCase();
-        const original = lowerToOriginal[lower];
-        if (original) {
-          solvedMap[original].rank = rank;
+  // ─── SECONDARY: ratingChanges (only fills missing rank, never overwrites) ──
+  if (standingsWorked) {
+    try {
+      const res = await axios.get(
+        `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
+        { timeout: 30000 }
+      );
+      if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.length > 0) {
+        const changeMap = {};
+        for (const entry of res.data.result) {
+          changeMap[entry.handle.toLowerCase()] = entry;
+        }
+        for (const handle of handles) {
+          const entry = changeMap[handle.toLowerCase()];
+          if (entry && solvedMap[handle] && solvedMap[handle].rank === null) {
+            solvedMap[handle].rank = entry.rank;       // only if standings didn't give rank
+          }
         }
       }
+    } catch (e) {
+      // ratingChanges fails → standings rank preserved (fine)
+      console.log(`No rating changes for contest ${contestId} (unrated or delayed)`);
     }
-  } else {
-    console.log(`No rating changes for contest ${contestId} (unrated or unavailable)`);
   }
 
-  // If standings didn't work, fallback to per‑member submissions with time filtering
+  // ─── FALLBACK (if standings failed entirely) ──────────────────────────────
   if (!standingsWorked) {
-    console.log(`🔄 Standings API failed or returned no rows; falling back to per‑user submissions for contest ${contestId}`);
+    console.log(`🔄 Standings API failed; falling back to per‑user submissions for contest ${contestId}`);
 
-    // Get contest start and end times from contestInfo or fetch
     let contestStart = 0, contestEnd = Infinity;
     if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
       contestStart = contestInfo.startTimeSeconds;
@@ -619,13 +614,6 @@ async function getContestStandings(contestId, handles, contestInfo) {
       } catch (_) {}
     }
 
-    // If we still don't have contest times, we cannot safely filter; return what we have (solves will be 0)
-    if (contestStart === 0 && contestEnd === Infinity) {
-      console.warn(`Could not determine contest time for ${contestId}; fallback will not count any submissions.`);
-      return solvedMap;
-    }
-
-    // Get problem keys for validation
     let problemKeys = new Set();
     try {
       const details = await getContestDetails(contestId);
@@ -671,10 +659,32 @@ async function getContestStandings(contestId, handles, contestInfo) {
       for (const r of batchResults) {
         if (solvedMap[r.handle]) {
           solvedMap[r.handle].solved = r.count;
-          // In fallback we have no penalty; keep 0
+          // rank stays null (no penalty either)
         }
       }
       if (i + 2 < handles.length) await sleep(1500);
+    }
+
+    // Optionally try to get ranks from ratingChanges if standings failed
+    if (!standingsWorked) {
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
+          { timeout: 15000 }
+        );
+        if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.length > 0) {
+          const changeMap = {};
+          for (const entry of res.data.result) {
+            changeMap[entry.handle.toLowerCase()] = entry;
+          }
+          for (const handle of handles) {
+            const entry = changeMap[handle.toLowerCase()];
+            if (entry && solvedMap[handle]) {
+              solvedMap[handle].rank = entry.rank;
+            }
+          }
+        }
+      } catch (_) {}
     }
   }
 
@@ -719,15 +729,12 @@ async function checkAndAnnounceWinner(sock) {
             }
           }
         }
-        // Mark winner as announced (even if no participants, to avoid re-checking)
         await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
       }
 
       // ─── Promotion Checker ──────────────────────────────────────────────
-      // Only process if rating changes haven't been announced for this contest
       if (groupData.lastRatingAnnounced === lastId) continue;
 
-      // Wait 30 minutes after contest end before checking rating changes
       const endTime = lastContest.startTimeSeconds + lastContest.durationSeconds;
       const now = Math.floor(Date.now() / 1000);
       if (now - endTime < 1800) {
@@ -735,7 +742,6 @@ async function checkAndAnnounceWinner(sock) {
         continue;
       }
 
-      // Fetch rating changes
       let ratingChanges = [];
       try {
         const res = await axios.get(
@@ -750,31 +756,22 @@ async function checkAndAnnounceWinner(sock) {
       }
 
       if (!ratingChanges.length) {
-        // No rating changes – mark as announced to avoid repeated attempts
         await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
         continue;
       }
 
-      // Build lowercase lookup map from ratingChanges
       const changeMap = {};
       for (const entry of ratingChanges) {
         changeMap[entry.handle.toLowerCase()] = entry;
       }
 
       const promoted = [];
-
       for (const handle of handles) {
         const entry = changeMap[handle.toLowerCase()];
-        if (!entry) continue; // not in rating changes (didn't participate)
-
+        if (!entry) continue;
         const oldRank = entry.oldRating === 0 ? "Unrated" : getRankFromRating(entry.oldRating);
         const newRank = getRankFromRating(entry.newRating);
-
-        const oldIdx = getRankIndex(oldRank);
-        const newIdx = getRankIndex(newRank);
-
-        if (newIdx > oldIdx) {
-          // genuine promotion
+        if (getRankIndex(newRank) > getRankIndex(oldRank)) {
           promoted.push({
             handle,
             oldRank,
@@ -786,7 +783,6 @@ async function checkAndAnnounceWinner(sock) {
         }
       }
 
-      // Send promotion message if any
       if (promoted.length) {
         let msg = `🎉 *Promotion Alerts!* 🎉\n\n`;
         for (const p of promoted) {
@@ -795,22 +791,18 @@ async function checkAndAnnounceWinner(sock) {
           msg += `🏅 New Rank: ${p.newRank}\n\n`;
         }
         msg += `🔥 Keep up the great work! 💪`;
-
-        // Send as one message (WhatsApp supports @mentions if the number is in the group)
         try {
           await sock.sendMessage(chatId, { text: msg });
         } catch (e) {
           console.error(`Failed to send promotion message to ${chatId}:`, e.message);
         }
       } else {
-        // Optionally send a short "no promotions" message (comment out if you want silence)
         const msg = `📊 Rating changes processed for ${lastContest.name}.\n😴 No rank promotions this time. Keep practicing! 💪`;
         try {
           await sock.sendMessage(chatId, { text: msg });
         } catch (e) {}
       }
 
-      // Mark rating changes as announced
       await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
 
     } catch (e) {
@@ -982,15 +974,11 @@ async function startBot() {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
 
-      // ─── Start reminder interval ──────────────────────────────────────
       console.log("✅ Reminder interval started");
       setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
 
-      // ─── Winner + Promotion checker ─────────────────────────────────
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
-
-      // ─── Startup grace check for reminders (missed contests) ──────
       setTimeout(() => checkAndSendReminders(sock), 30 * 1000);
     }
   });
@@ -1177,7 +1165,6 @@ async function startBot() {
 
           let contestInfo = null;
 
-          // Try to get contest info from contest.list first
           try {
             const list = await getCFContestList();
             const found = list.find(c => c.id == contestId);
@@ -1186,7 +1173,6 @@ async function startBot() {
             console.error("Error fetching contest list:", e.message);
           }
 
-          // Fallback: fetch contest details directly via contest.standings
           if (!contestInfo) {
             console.log(`🔄 Fallback: fetching contest ${contestId} directly via standings`);
             try {
