@@ -11,6 +11,7 @@ const {
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const axios = require("axios");
+const cheerio = require("cheerio");
 const pino = require("pino");
 
 let latestQR = null;
@@ -105,6 +106,24 @@ function getAllHandles(groupData) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Rating → Points Mapping ──────────────────────────────────────────────────
+const RATING_TO_POINTS = {
+  800: 10,  900: 12,  1000: 14, 1100: 16, 1200: 18,
+  1300: 21, 1400: 25, 1500: 29,
+  1600: 33, 1700: 39, 1800: 45,
+  1900: 52, 2000: 60, 2100: 70,
+  2200: 81, 2300: 95, 2400: 110,
+  2500: 128, 2600: 149, 2700: 173,
+  2800: 201, 2900: 233, 3000: 271,
+};
+
+function calculatePointsForRating(rating) {
+  if (!rating) return 0;
+  // Round to nearest 100 within 800-3000 range
+  const rounded = Math.min(3000, Math.max(800, Math.round(rating / 100) * 100));
+  return RATING_TO_POINTS[rounded] || 0;
+}
 
 // ─── Codeforces API ───────────────────────────────────────────────────────────
 async function getCFUser(handle) {
@@ -513,27 +532,23 @@ async function getContestDetails(contestId) {
   }
 }
 
-// ─── getContestStandings with case‑insensitive matching ──────────────────────
+// ─── getContestStandings ──────────────────────────────────────────────────────
 async function getContestStandings(contestId, handles) {
   if (!handles || handles.length === 0) return {};
 
-  // Build a map from lowercase to original handle
   const lowerToOriginal = {};
   for (const h of handles) {
     lowerToOriginal[h.toLowerCase()] = h;
   }
 
-  // 1. Try official standings API with handles parameter
   try {
     const handlesStr = handles.join(';');
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesStr}&showUnofficial=true`;
     const res = await axios.get(url, { timeout: 25000 });
 
-    // If we have rows, build the map
     if (res.data && res.data.result && res.data.result.rows && res.data.result.rows.length > 0) {
       const rows = res.data.result.rows;
       const solvedMap = {};
-      // Initialize with 0 for all input handles
       for (const h of handles) solvedMap[h] = 0;
 
       for (const row of rows) {
@@ -543,7 +558,6 @@ async function getContestStandings(contestId, handles) {
         ).length;
         for (const apiHandle of memberHandles) {
           const lower = apiHandle.toLowerCase();
-          // Find the corresponding input handle (case-insensitive)
           const original = lowerToOriginal[lower];
           if (original) {
             solvedMap[original] = acceptedCount;
@@ -552,13 +566,10 @@ async function getContestStandings(contestId, handles) {
       }
       return solvedMap;
     }
-    // rows empty → fall through to fallback
   } catch (e) {
     console.error(`Standings API failed for ${contestId}:`, e.message);
-    // fall through to fallback
   }
 
-  // 2. Fallback: per‑member submissions (full history)
   console.log(`🔄 Falling back to per‑user submission check for contest ${contestId}`);
   let problemSet = new Set();
   try {
@@ -568,11 +579,9 @@ async function getContestStandings(contestId, handles) {
     }
   } catch (e) {
     console.error('Failed to fetch contest details for fallback:', e.message);
-    // continue with empty problemSet (will count all accepted submissions in this contest)
   }
 
   const solvedMap = {};
-  // Initialize with 0 for all input handles
   for (const h of handles) solvedMap[h] = 0;
 
   for (let i = 0; i < handles.length; i += 2) {
@@ -607,12 +616,15 @@ async function getContestStandings(contestId, handles) {
   return solvedMap;
 }
 
-// ─── Weekly Leaderboard ──────────────────────────────────────────────────────
+// ─── Weekly Leaderboard (points‑based) ──────────────────────────────────────
 async function getWeeklyLeaderboard(handles) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   const nowIST = Date.now() + IST_OFFSET_MS;
   const weekAgoIST = nowIST - 7 * 24 * 60 * 60 * 1000;
+
   const results = [];
+
+  // Process 2 members at a time
   for (let i = 0; i < handles.length; i += 2) {
     const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -622,22 +634,39 @@ async function getWeeklyLeaderboard(handles) {
           { timeout: 10000 }
         );
         const subs = res.data.result || [];
-        const solved = new Set();
+
+        // Store unique problems and their ratings
+        const solvedMap = {}; // key: "contestId-index" -> { rating }
+        let totalPoints = 0;
+
         for (const s of subs) {
           if (s.verdict === "OK" && s.problem) {
             const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
             if (subTimeIST >= weekAgoIST) {
-              solved.add(`${s.problem.contestId}-${s.problem.index}`);
+              const key = `${s.problem.contestId}-${s.problem.index}`;
+              if (!solvedMap[key]) {
+                // Get rating, fallback to 0 if missing
+                const rating = s.problem.rating || 0;
+                solvedMap[key] = rating;
+                totalPoints += calculatePointsForRating(rating);
+              }
             }
           }
         }
-        return { handle, count: solved.size };
-      } catch { return { handle, count: 0 }; }
+        // Also count the number of problems solved
+        const problemCount = Object.keys(solvedMap).length;
+        return { handle, points: totalPoints, count: problemCount };
+      } catch (e) {
+        console.error(`Error fetching for ${handle}:`, e.message);
+        return { handle, points: 0, count: 0 };
+      }
     }));
     results.push(...batchResults);
     if (i + 2 < handles.length) await sleep(1500);
   }
-  return results.sort((a, b) => b.count - a.count);
+
+  // Sort by points descending, then by count descending
+  return results.sort((a, b) => b.points - a.points || b.count - a.count);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -744,7 +773,7 @@ async function startBot() {
 
       try {
 
-        // ── // add h1 h2 h3 ───────────────────────────────────────────────────
+        // ── // add ───────────────────────────────────────────────────────────
         if (command.startsWith("// add ")) {
           const args = body.slice(7).trim().split(/\s+/).filter(Boolean);
           if (!args.length) { await reply("❌ Usage: `// add <cf_handle>`\nOr multiple: `// add h1 h2 h3`"); continue; }
@@ -769,7 +798,7 @@ async function startBot() {
           await reply(text);
         }
 
-        // ── // remove ─────────────────────────────────────────────────────────
+        // ── // remove ──────────────────────────────────────────────────────
         else if (command.startsWith("// remove")) {
           const myHandles = groupData.members[senderId] || [];
           if (!myHandles.length) { await reply("❌ You haven't registered any CF handles."); continue; }
@@ -789,7 +818,7 @@ async function startBot() {
           }
         }
 
-        // ── // rating ─────────────────────────────────────────────────────────
+        // ── // rating ──────────────────────────────────────────────────────
         else if (command === "// rating") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No one registered yet!\nUse `// add your_cf_id` to join."); continue; }
@@ -806,7 +835,7 @@ async function startBot() {
           await reply(text);
         }
 
-        // ── // myrating ───────────────────────────────────────────────────────
+        // ── // myrating ──────────────────────────────────────────────────
         else if (command === "// myrating") {
           const myHandles = groupData.members[senderId] || [];
           if (!myHandles.length) { await reply("❌ Not registered!\nUse `// add your_cf_id` first."); continue; }
@@ -818,7 +847,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // upcoming ───────────────────────────────────────────────────────
+        // ── // upcoming ──────────────────────────────────────────────────
         else if (command === "// upcoming") {
           await reply("⏳ Fetching upcoming contests from all platforms...");
           const [cf, lc, cc] = await Promise.all([
@@ -841,7 +870,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // solved (auto-detect only) ──────────────────────────────────────
+        // ── // solved ──────────────────────────────────────────────────
         else if (command === "// solved") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
@@ -878,7 +907,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // contest <contest_id_or_url> ───────────────────────────────────
+        // ── // contest ──────────────────────────────────────────────────
         else if (command.startsWith("// contest ")) {
           const input = body.slice(10).trim();
           if (!input) {
@@ -902,7 +931,6 @@ async function startBot() {
             continue;
           }
 
-          // Verify contest exists
           let contestInfo = null;
           try {
             const list = await getCFContestList();
@@ -955,7 +983,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // whosolvedtoday <problem_url> ─────────────────────────────────
+        // ── // whosolvedtoday ──────────────────────────────────────────
         else if (command.startsWith("// whosolvedtoday ")) {
           const url = body.slice(18).trim();
           
@@ -1042,7 +1070,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // streak <cf_id> ─────────────────────────────────────────────────
+        // ── // streak ──────────────────────────────────────────────────
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
           if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
@@ -1062,7 +1090,7 @@ async function startBot() {
           await reply(text);
         }
 
-        // ── // info <cf_id> ───────────────────────────────────────────────────
+        // ── // info ──────────────────────────────────────────────────
         else if (command.startsWith("// info")) {
           const arg = body.slice(7).trim();
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
@@ -1093,7 +1121,7 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // compare mem1 mem2 ─────────────────────────────────────────────
+        // ── // compare ──────────────────────────────────────────────────
         else if (command.startsWith("// compare")) {
           const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
@@ -1136,29 +1164,94 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // leaderboard week ──────────────────────────────────────────────
+        // ── // leaderboard week ──────────────────────────────────────────
         else if (command === "// leaderboard week") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          const estimatedSeconds = Math.ceil(handles.length * 0.75);
+          const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
           await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
+
           const results = await getWeeklyLeaderboard(handles);
-          const active = results.filter((r) => r.count > 0);
-          let text = `🏅 *Weekly Leaderboard*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
+          const active = results.filter((r) => r.points > 0);
+
+          let text = `🏅 *Weekly Leaderboard (Points)*\n${"─".repeat(28)}\n📅 Last 7 days (IST)\n\n`;
+
           if (!active.length) {
             text += `😴 No one solved any problems this week!\nStart grinding! 💪`;
           } else {
             active.forEach((r, i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${r.handle}* — ${r.count} problem${r.count > 1 ? "s" : ""}\n`;
+              text += `${medal} *${r.handle}* — ${r.points} pts (${r.count} problem${r.count>1?'s':''})\n`;
             });
-            const inactive = results.filter((r) => r.count === 0);
+            const inactive = results.filter((r) => r.points === 0);
             if (inactive.length) text += `\n😴 No activity: ${inactive.map(r => r.handle).join(", ")}`;
           }
+
           await reply(text.trim());
         }
 
-        // ── // help ───────────────────────────────────────────────────────────
+        // ── // solution ──────────────────────────────────────────────────
+        else if (command.startsWith("// solution ")) {
+          const url = body.slice(11).trim();
+          if (!url) {
+            await reply("❌ Usage: `// solution <problem_url>`\nExample: `// solution https://codeforces.com/contest/1790/problem/D`");
+            continue;
+          }
+          // Extract contest ID
+          const match = url.match(/codeforces\.com\/contest\/(\d+)/i);
+          if (!match) {
+            await reply("❌ Invalid Codeforces contest URL. Provide a contest URL like https://codeforces.com/contest/1790");
+            continue;
+          }
+          const contestId = match[1];
+          await reply(`🔍 Searching for editorial of contest ${contestId}...`);
+
+          try {
+            // Fetch contest page
+            const contestPage = await axios.get(`https://codeforces.com/contest/${contestId}`, {
+              timeout: 10000,
+              headers: { "User-Agent": "Mozilla/5.0" }
+            });
+            const $ = cheerio.load(contestPage.data);
+            // Look for a link to the editorial (usually contains "Tutorial" or "Editorial")
+            let editorialUrl = null;
+            $('a').each((_, el) => {
+              const href = $(el).attr('href');
+              const text = $(el).text().toLowerCase();
+              if (href && (text.includes('tutorial') || text.includes('editorial'))) {
+                editorialUrl = href;
+                return false; // break
+              }
+            });
+            if (!editorialUrl) {
+              await reply(`❌ No tutorial found for contest ${contestId}. Check the contest page directly:\nhttps://codeforces.com/contest/${contestId}`);
+              continue;
+            }
+            // Ensure full URL
+            if (editorialUrl.startsWith('/')) editorialUrl = 'https://codeforces.com' + editorialUrl;
+            // Fetch the editorial blog
+            const editorialPage = await axios.get(editorialUrl, {
+              timeout: 10000,
+              headers: { "User-Agent": "Mozilla/5.0" }
+            });
+            const $2 = cheerio.load(editorialPage.data);
+            // Extract content from the blog post
+            const content = $2('.ttypography').text() || $2('.content').text() || $2('article').text();
+            if (!content) {
+              await reply(`❌ Could not extract solution content from editorial. Full editorial link:\n${editorialUrl}`);
+              continue;
+            }
+            // Send first 1500 characters + link
+            const preview = content.slice(0, 1500) + (content.length > 1500 ? '...' : '');
+            let msg = `📖 *Editorial for Contest ${contestId}*\n${"─".repeat(28)}\n\n${preview}\n\n🔗 Full editorial: ${editorialUrl}`;
+            await reply(msg);
+          } catch (e) {
+            console.error('solution error:', e.message);
+            await reply(`❌ Failed to fetch editorial. The contest may not have a written tutorial yet. Try: https://codeforces.com/contest/${contestId}`);
+          }
+        }
+
+        // ── // help ──────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
             `🤖 *CF Group Bot — Commands*\n\n` +
@@ -1175,7 +1268,8 @@ async function startBot() {
             `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
-            `🏅 \`// leaderboard week\`\n    Who solved most problems this week\n\n` +
+            `🏅 \`// leaderboard week\`\n    Who scored most points this week (based on problem rating)\n\n` +
+            `📖 \`// solution <problem_url>\`\n    Get editorial/solution for a problem\n    Example: \`// solution https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every CF contest!*\n` +
             `📢 *Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!*`
