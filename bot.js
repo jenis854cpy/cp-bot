@@ -29,6 +29,7 @@ const CFData = mongoose.model("CFData",
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
     lastContestAnnounced: { type: Number, default: 0 },
+    lastRatingAnnounced: { type: Number, default: 0 },
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
@@ -78,10 +79,11 @@ async function useMongoAuthState() {
 // ─── Group Data ────────────────────────────────────────────────────────────────
 async function getGroupData(chatId) {
   const group = await CFData.findOne({ chatId }).lean();
-  if (!group) return { members: {}, lastContestAnnounced: 0, reminders: {} };
+  if (!group) return { members: {}, lastContestAnnounced: 0, lastRatingAnnounced: 0, reminders: {} };
   return {
     members: group.members || {},
     lastContestAnnounced: group.lastContestAnnounced || 0,
+    lastRatingAnnounced: group.lastRatingAnnounced || 0,
     reminders: group.reminders || {},
   };
 }
@@ -91,6 +93,7 @@ async function saveGroupData(chatId, groupData) {
     { $set: {
       members: groupData.members,
       lastContestAnnounced: groupData.lastContestAnnounced,
+      lastRatingAnnounced: groupData.lastRatingAnnounced || 0,
       reminders: groupData.reminders || {},
     }},
     { upsert: true });
@@ -105,6 +108,19 @@ function getAllHandles(groupData) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Rank order for promotion detection ──────────────────────────────────────
+const RANK_ORDER = [
+  "Unrated", "Newbie", "Pupil", "Specialist",
+  "Expert", "Candidate Master", "Master",
+  "International Master", "Grandmaster",
+  "International Grandmaster", "Legendary Grandmaster"
+];
+
+function getRankIndex(rank) {
+  const idx = RANK_ORDER.indexOf(rank);
+  return idx === -1 ? 0 : idx;
+}
 
 // ─── Rating → Points Mapping ──────────────────────────────────────────────────
 const RATING_TO_POINTS = {
@@ -121,6 +137,21 @@ function calculatePointsForRating(rating) {
   if (!rating) return 17;
   const rounded = Math.min(3000, Math.max(800, Math.round(rating / 100) * 100));
   return RATING_TO_POINTS[rounded] || 17;
+}
+
+// ─── Rank thresholds ──────────────────────────────────────────────────────────
+function getRankFromRating(rating) {
+  if (rating === undefined || rating === null) return "Unrated";
+  if (rating >= 3000) return "Legendary Grandmaster";
+  if (rating >= 2600) return "International Grandmaster";
+  if (rating >= 2400) return "Grandmaster";
+  if (rating >= 2300) return "International Master";
+  if (rating >= 2100) return "Master";
+  if (rating >= 1900) return "Candidate Master";
+  if (rating >= 1600) return "Expert";
+  if (rating >= 1400) return "Specialist";
+  if (rating >= 1200) return "Pupil";
+  return "Newbie";
 }
 
 // ─── Codeforces API ───────────────────────────────────────────────────────────
@@ -478,7 +509,6 @@ function compareContestEntries(a, b) {
   const aRank = aData.rank;
   const bRank = bData.rank;
   if (aRank !== null && bRank !== null && aRank !== bRank) return aRank - bRank;
-  //  ↑ equal ranks fall through to penalty
 
   // 3. Penalty ascending (live / unrated)
   const aPenalty = aData.penalty ?? Infinity;
@@ -651,42 +681,141 @@ async function getContestStandings(contestId, handles, contestInfo) {
   return solvedMap;
 }
 
-// ─── Winner Checker (Codeforces only) ────────────────────────────────────────
+// ─── Winner Checker + Promotion Checker ──────────────────────────────────────
 async function checkAndAnnounceWinner(sock) {
   const groups = await CFData.find({}).lean();
   for (const group of groups) {
     const chatId = group.chatId;
     if (!chatId.endsWith("@g.us")) continue;
-    const groupData = { members: group.members || {}, lastContestAnnounced: group.lastContestAnnounced || 0 };
+    const groupData = await getGroupData(chatId);
     const handles = getAllHandles(groupData);
     if (!handles.length) continue;
+
     try {
       const lastContest = await getRecentFinishedContest();
       if (!lastContest) continue;
       const lastId = lastContest.id;
-      if (groupData.lastContestAnnounced === lastId) continue;
-      const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
+
+      // ─── Winner announcement ──────────────────────────────────────────────
+      if (groupData.lastContestAnnounced !== lastId) {
+        const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
+        const now = Math.floor(Date.now() / 1000);
+        if (now - finishedAt <= 7200) {
+          const solvedMap = await getContestStandings(lastId, handles, lastContest);
+          if (solvedMap) {
+            const entries = Object.entries(solvedMap)
+              .filter(([, data]) => data.solved > 0)
+              .sort(compareContestEntries);
+            if (entries.length) {
+              const [winner, winnerData] = entries[0];
+              let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
+              text += `🏆 *Group Winner: ${winner}* with *${winnerData.solved}* solved${winnerData.rank ? ` (Rank #${winnerData.rank})` : ''}!\n\n📊 *Group Performance:*\n`;
+              entries.forEach(([h, data], i) => {
+                const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+                const rankStr = data.rank ? ` | Rank #${data.rank}` : ' | Unrated';
+                text += `${medal} *${h}* — ✅ ${data.solved} solved${rankStr}\n`;
+              });
+              await sock.sendMessage(chatId, { text });
+            }
+          }
+        }
+        // Mark winner as announced (even if no participants, to avoid re-checking)
+        await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
+      }
+
+      // ─── Promotion Checker ──────────────────────────────────────────────
+      // Only process if rating changes haven't been announced for this contest
+      if (groupData.lastRatingAnnounced === lastId) continue;
+
+      // Wait 30 minutes after contest end before checking rating changes
+      const endTime = lastContest.startTimeSeconds + lastContest.durationSeconds;
       const now = Math.floor(Date.now() / 1000);
-      if (now - finishedAt > 7200) { await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId }); continue; }
-      const solvedMap = await getContestStandings(lastId, handles, lastContest);
-      if (!solvedMap) continue;
-      const entries = Object.entries(solvedMap)
-        .filter(([, data]) => data.solved > 0)
-        .sort(compareContestEntries);
-      if (!entries.length) continue;
-      const [winner, winnerData] = entries[0];
-      const winnerSolved = winnerData.solved;
-      const winnerRank = winnerData.rank;
-      let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
-      text += `🏆 *Group Winner: ${winner}* with *${winnerSolved}* solved${winnerRank ? ` (Rank #${winnerRank})` : ''}!\n\n📊 *Group Performance:*\n`;
-      entries.forEach(([h, data], i) => {
-        const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-        const rankStr = data.rank ? ` | Rank #${data.rank}` : ' | Unrated';
-        text += `${medal} *${h}* — ✅ ${data.solved} solved${rankStr}\n`;
-      });
-      await sock.sendMessage(chatId, { text });
-      await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
-    } catch (e) { console.error(`Winner check error ${chatId}:`, e.message); }
+      if (now - endTime < 1800) {
+        console.log(`⏳ Waiting for rating changes to be available for contest ${lastId} (ended ${Math.floor((now-endTime)/60)} min ago)`);
+        continue;
+      }
+
+      // Fetch rating changes
+      let ratingChanges = [];
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/contest.ratingChanges?contestId=${lastId}`,
+          { timeout: 15000 }
+        );
+        if (res.data && res.data.status === 'OK' && res.data.result) {
+          ratingChanges = res.data.result;
+        }
+      } catch (e) {
+        console.log(`No rating changes for contest ${lastId} (unrated or not available)`);
+      }
+
+      if (!ratingChanges.length) {
+        // No rating changes – mark as announced to avoid repeated attempts
+        await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
+        continue;
+      }
+
+      // Build lowercase lookup map from ratingChanges
+      const changeMap = {};
+      for (const entry of ratingChanges) {
+        changeMap[entry.handle.toLowerCase()] = entry;
+      }
+
+      const promoted = [];
+
+      for (const handle of handles) {
+        const entry = changeMap[handle.toLowerCase()];
+        if (!entry) continue; // not in rating changes (didn't participate)
+
+        const oldRank = entry.oldRating === 0 ? "Unrated" : getRankFromRating(entry.oldRating);
+        const newRank = getRankFromRating(entry.newRating);
+
+        const oldIdx = getRankIndex(oldRank);
+        const newIdx = getRankIndex(newRank);
+
+        if (newIdx > oldIdx) {
+          // genuine promotion
+          promoted.push({
+            handle,
+            oldRank,
+            newRank,
+            oldRating: entry.oldRating,
+            newRating: entry.newRating,
+            delta: entry.newRating - entry.oldRating,
+          });
+        }
+      }
+
+      // Send promotion message if any
+      if (promoted.length) {
+        let msg = `🎉 *Promotion Alerts!* 🎉\n\n`;
+        for (const p of promoted) {
+          msg += `@${p.handle} — Congratulations! You've been promoted from *${p.oldRank}* to *${p.newRank}*! 🚀\n`;
+          msg += `📊 Rating Change: ${p.oldRating} → ${p.newRating} (${p.delta >= 0 ? '+' : ''}${p.delta})\n`;
+          msg += `🏅 New Rank: ${p.newRank}\n\n`;
+        }
+        msg += `🔥 Keep up the great work! 💪`;
+
+        // Send as one message (WhatsApp supports @mentions if the number is in the group)
+        try {
+          await sock.sendMessage(chatId, { text: msg });
+        } catch (e) {
+          console.error(`Failed to send promotion message to ${chatId}:`, e.message);
+        }
+      } else {
+        // Optionally send a short "no promotions" message (comment out if you want silence)
+        const msg = `📊 Rating changes processed for ${lastContest.name}.\n😴 No rank promotions this time. Keep practicing! 💪`;
+        try {
+          await sock.sendMessage(chatId, { text: msg });
+        } catch (e) {}
+      }
+
+      // Mark rating changes as announced
+      await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
+
+    } catch (e) {
+      console.error(`Winner/Promotion check error for ${chatId}:`, e.message);
+    }
   }
 }
 
@@ -857,7 +986,7 @@ async function startBot() {
       console.log("✅ Reminder interval started");
       setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
 
-      // ─── Winner checker ──────────────────────────────────────────────
+      // ─── Winner + Promotion checker ─────────────────────────────────
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
 
@@ -1347,6 +1476,7 @@ async function startBot() {
             `✦ *AUTO FEATURES*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `🥇 *Winner Alert*\n   _Announced live right after_\n   _every CF contest — automatic!_\n\n` +
+            `🎉 *Promotion Alert*\n   _Congrats when you rank up!_\n\n` +
             `⏰ *Contest Reminder*\n   _Auto sent 24h & 1h before_\n   _every contest. Never miss one!_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n` +
             `✦  *Code hard. Rank higher.* 🚀\n` +
