@@ -376,7 +376,7 @@ async function getLeetCodeUpcoming() {
   } catch { return []; }
 }
 
-// ─── Reminder System with fixes ──────────────────────────────────────────────
+// ─── Reminder System ──────────────────────────────────────────────────────────
 async function checkAndSendReminders(sock) {
   try {
     const [cf, cc, lc] = await Promise.all([
@@ -415,7 +415,7 @@ async function checkAndSendReminders(sock) {
             reminders[contest.id].daySent = true;
           }
         }
-        // 1-hour reminder: 30–90 minutes (wider window)
+        // 1-hour reminder: 30–90 minutes
         if (diff >= 30 * 60 && diff <= 90 * 60) {
           if (!reminders[contest.id]?.hourSent) {
             await sendReminder(sock, chatId, contest, "hour");
@@ -466,22 +466,21 @@ async function sendReminder(sock, chatId, contest, type) {
   }
 }
 
-// ─── Sorting comparator with penalty ────────────────────────────────────────
+// ─── Sorting comparator (corrected) ─────────────────────────────────────────
 function compareContestEntries(a, b) {
   const aData = a[1];
   const bData = b[1];
 
-  // 1. Solved count descending
+  // 1. More solves first
   if (bData.solved !== aData.solved) return bData.solved - aData.solved;
 
-  // 2. Rank ascending (only if both have rank – for rated finished contests)
+  // 2. Rank — ONLY when BOTH have a rank (finished rated contest)
   const aRank = aData.rank;
   const bRank = bData.rank;
-  if (aRank !== null && bRank !== null) return aRank - bRank;
-  if (aRank !== null) return -1;
-  if (bRank !== null) return 1;
+  if (aRank !== null && bRank !== null && aRank !== bRank) return aRank - bRank;
+  //  ↑ equal ranks fall through to penalty
 
-  // 3. Penalty ascending (live contests or unrated)
+  // 3. Penalty ascending (live / unrated)
   const aPenalty = aData.penalty ?? Infinity;
   const bPenalty = bData.penalty ?? Infinity;
   if (aPenalty !== bPenalty) return aPenalty - bPenalty;
