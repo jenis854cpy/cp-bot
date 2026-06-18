@@ -1183,23 +1183,29 @@ async function startBot() {
         else if (command === "// help") {
           await reply(
             `🤖 *CF Group Bot — Commands*\n\n` +
-            `➕ \`// add <cf_id>\`\n    Register your CF handle\n\n` +
-            `➕ \`// add h1 h2 h3\`\n    Add multiple handles at once\n\n` +
-            `❌ \`// remove\`\n    Remove all your handles\n\n` +
+            `👤 *Handle Management*\n` +
+            `➕ \`// add <cf_id>\`\n    Register your CF handle\n` +
+            `➕ \`// add h1 h2 h3\`\n    Add multiple handles at once\n` +
+            `❌ \`// remove\`\n    Remove all your handles\n` +
             `❌ \`// remove <cf_id>\`\n    Remove one specific handle\n\n` +
-            `🏆 \`// rating\`\n    Group leaderboard by rating\n\n` +
-            `👤 \`// myrating\`\n    Your own CF rating & rank\n\n` +
-            `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n\n` +
-            `📊 \`// solved\`\n    Who solved what in latest contest\n\n` +
-            `📋 \`// contest <id_or_url>\`\n    Show standings for a specific contest\n    Example: \`// contest 1790\` or \`// contest https://codeforces.com/contest/1790\`\n\n` +
-            `📅 \`// whosolvedtoday <problem_url>\`\n    Check who solved a problem today (IST)\n    Example: \`// whosolvedtoday https://codeforces.com/contest/1790/problem/D\`\n\n` +
-            `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n\n` +
-            `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
+            `🏆 *Leaderboards & Stats*\n` +
+            `🏆 \`// rating\`\n    Group leaderboard by rating\n` +
+            `🏅 \`// leaderboard week\`\n    Who scored most points this week (Delta7)\n` +
+            `👤 \`// myrating\`\n    Your own CF rating & rank\n` +
+            `🔥 \`// streak <cf_id>\`\n    Current & max streak for any CF user\n    Example: \`// streak tourist\`\n` +
+            `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
-            `🏅 \`// leaderboard week\`\n    Weekly performance ranking\n\n` +
+            `⚔️ *Contests & Live Insights*\n` +
+            `📅 \`// upcoming\`\n    Upcoming CF + LeetCode + CodeChef contests\n` +
+            `📊 \`// solved\`\n    Who solved what in latest contest\n` +
+            `📋 \`// contest <id_or_url>\`\n    Show standings for a specific contest\n    Example: \`// contest 1790\`\n\n` +
+            `📅 *Daily Tracking*\n` +
+            `📅 \`// whosolvedtoday <problem_url>\`\n    Check who solved a problem today (IST)\n    Example: \`// whosolvedtoday https://codeforces.com/contest/1790/problem/D\`\n\n` +
+            `❓ *System*\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
-            `🏁 *Auto-announces group winner after every CF contest!*\n` +
-            `📢 *Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!*`
+            `==============================\n` +
+            `🏁 Auto-announces group winner after every CF contest!\n` +
+            `📢 Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!`
           );
         }
 
