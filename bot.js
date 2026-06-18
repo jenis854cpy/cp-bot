@@ -11,7 +11,6 @@ const {
 } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const axios = require("axios");
-const cheerio = require("cheerio");
 const pino = require("pino");
 
 let latestQR = null;
@@ -514,7 +513,6 @@ async function getRunningContest() {
   } catch { return null; }
 }
 
-// Lightweight function to get contest details (problems, name, etc.)
 async function getContestDetails(contestId) {
   try {
     const res = await axios.get(
@@ -532,7 +530,6 @@ async function getContestDetails(contestId) {
   }
 }
 
-// ─── getContestStandings ──────────────────────────────────────────────────────
 async function getContestStandings(contestId, handles) {
   if (!handles || handles.length === 0) return {};
 
@@ -624,7 +621,6 @@ async function getWeeklyLeaderboard(handles) {
 
   const results = [];
 
-  // Process 2 members at a time
   for (let i = 0; i < handles.length; i += 2) {
     const batch = handles.slice(i, i + 2);
     const batchResults = await Promise.all(batch.map(async (handle) => {
@@ -635,8 +631,7 @@ async function getWeeklyLeaderboard(handles) {
         );
         const subs = res.data.result || [];
 
-        // Store unique problems and their ratings
-        const solvedMap = {}; // key: "contestId-index" -> { rating }
+        const solvedMap = {};
         let totalPoints = 0;
 
         for (const s of subs) {
@@ -645,7 +640,6 @@ async function getWeeklyLeaderboard(handles) {
             if (subTimeIST >= weekAgoIST) {
               const key = `${s.problem.contestId}-${s.problem.index}`;
               if (!solvedMap[key]) {
-                // Get rating, fallback to 0 if missing
                 const rating = s.problem.rating || 0;
                 solvedMap[key] = rating;
                 totalPoints += calculatePointsForRating(rating);
@@ -653,7 +647,6 @@ async function getWeeklyLeaderboard(handles) {
             }
           }
         }
-        // Also count the number of problems solved
         const problemCount = Object.keys(solvedMap).length;
         return { handle, points: totalPoints, count: problemCount };
       } catch (e) {
@@ -665,7 +658,6 @@ async function getWeeklyLeaderboard(handles) {
     if (i + 2 < handles.length) await sleep(1500);
   }
 
-  // Sort by points descending, then by count descending
   return results.sort((a, b) => b.points - a.points || b.count - a.count);
 }
 
@@ -1190,67 +1182,6 @@ async function startBot() {
           await reply(text.trim());
         }
 
-        // ── // solution ──────────────────────────────────────────────────
-        else if (command.startsWith("// solution ")) {
-          const url = body.slice(11).trim();
-          if (!url) {
-            await reply("❌ Usage: `// solution <problem_url>`\nExample: `// solution https://codeforces.com/contest/1790/problem/D`");
-            continue;
-          }
-          // Extract contest ID
-          const match = url.match(/codeforces\.com\/contest\/(\d+)/i);
-          if (!match) {
-            await reply("❌ Invalid Codeforces contest URL. Provide a contest URL like https://codeforces.com/contest/1790");
-            continue;
-          }
-          const contestId = match[1];
-          await reply(`🔍 Searching for editorial of contest ${contestId}...`);
-
-          try {
-            // Fetch contest page
-            const contestPage = await axios.get(`https://codeforces.com/contest/${contestId}`, {
-              timeout: 10000,
-              headers: { "User-Agent": "Mozilla/5.0" }
-            });
-            const $ = cheerio.load(contestPage.data);
-            // Look for a link to the editorial (usually contains "Tutorial" or "Editorial")
-            let editorialUrl = null;
-            $('a').each((_, el) => {
-              const href = $(el).attr('href');
-              const text = $(el).text().toLowerCase();
-              if (href && (text.includes('tutorial') || text.includes('editorial'))) {
-                editorialUrl = href;
-                return false; // break
-              }
-            });
-            if (!editorialUrl) {
-              await reply(`❌ No tutorial found for contest ${contestId}. Check the contest page directly:\nhttps://codeforces.com/contest/${contestId}`);
-              continue;
-            }
-            // Ensure full URL
-            if (editorialUrl.startsWith('/')) editorialUrl = 'https://codeforces.com' + editorialUrl;
-            // Fetch the editorial blog
-            const editorialPage = await axios.get(editorialUrl, {
-              timeout: 10000,
-              headers: { "User-Agent": "Mozilla/5.0" }
-            });
-            const $2 = cheerio.load(editorialPage.data);
-            // Extract content from the blog post
-            const content = $2('.ttypography').text() || $2('.content').text() || $2('article').text();
-            if (!content) {
-              await reply(`❌ Could not extract solution content from editorial. Full editorial link:\n${editorialUrl}`);
-              continue;
-            }
-            // Send first 1500 characters + link
-            const preview = content.slice(0, 1500) + (content.length > 1500 ? '...' : '');
-            let msg = `📖 *Editorial for Contest ${contestId}*\n${"─".repeat(28)}\n\n${preview}\n\n🔗 Full editorial: ${editorialUrl}`;
-            await reply(msg);
-          } catch (e) {
-            console.error('solution error:', e.message);
-            await reply(`❌ Failed to fetch editorial. The contest may not have a written tutorial yet. Try: https://codeforces.com/contest/${contestId}`);
-          }
-        }
-
         // ── // help ──────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
@@ -1269,7 +1200,6 @@ async function startBot() {
             `👤 \`// info <cf_id>\`\n    Profile + total solved + rating breakdown\n    Example: \`// info tourist\`\n\n` +
             `⚔️ \`// compare <id1> <id2>\`\n    Compare rating, solved, contests & max streak\n    Example: \`// compare tourist jiangly\`\n\n` +
             `🏅 \`// leaderboard week\`\n    Who scored most points this week (based on problem rating)\n\n` +
-            `📖 \`// solution <problem_url>\`\n    Get editorial/solution for a problem\n    Example: \`// solution https://codeforces.com/contest/1790/problem/D\`\n\n` +
             `❓ \`// help\`\n    Show this command list\n\n` +
             `🏁 *Auto-announces group winner after every CF contest!*\n` +
             `📢 *Auto‑reminds for CF, LeetCode & CodeChef 1 day & 1 hour before!*`
