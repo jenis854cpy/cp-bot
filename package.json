@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node bot.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
     "axios": "^1.6.0",

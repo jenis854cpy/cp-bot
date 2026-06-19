@@ -605,10 +605,14 @@ function getProblemLabels(count) {
   return labels.join(' ');
 }
 
+// ─── getContestInfo (using axios) ────────────────────────────────────────────
 async function getContestInfo(contestId) {
   try {
-    const response = await fetch(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`);
-    const data = await response.json();
+    const response = await axios.get(
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+      { timeout: 8000 }
+    );
+    const data = response.data;
     if (data && data.status === 'OK' && data.result && data.result.contest) {
       return data.result.contest;
     }
@@ -626,103 +630,89 @@ async function getContestInfo(contestId) {
   }
 }
 
-// ─── getContestStandings (fixed) ─────────────────────────────────────────────
+// ─── getContestStandings (using axios) ───────────────────────────────────────
 async function getContestStandings(contestId, handles) {
-  return new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
-      resolve({ success: false, error: 'Request timeout' });
-    }, 12000);
+  try {
+    const handlesParam = Array.isArray(handles) ? handles.join(';') : handles;
+    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000`;
+    
+    const response = await axios.get(url, { timeout: 12000 });
+    const data = response.data;
 
-    try {
-      const handlesParam = Array.isArray(handles) ? handles.join(';') : handles;
-      const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000`;
+    if (data && data.status === 'OK' && data.result) {
+      const problemCount = data.result.problems ? data.result.problems.length : 0;
+      const phase = data.result.contest ? data.result.contest.phase : 'FINISHED';
       
-      fetch(url)
-        .then(response => response.json())
-        .then(data => {
-          clearTimeout(timeoutId);
-          
-          if (data && data.status === 'OK' && data.result) {
-            const problemCount = data.result.problems ? data.result.problems.length : 0;
-            const phase = data.result.contest ? data.result.contest.phase : 'FINISHED';
-            
-            // Initialize ALL members with 0 solves
-            const allResults = handles.map(handle => ({
-              handle: handle,
-              rank: null,
-              solved: 0,
-              penalty: 0,
-              totalProblems: problemCount,
-              problemResults: []
-            }));
+      // Initialize ALL members with 0 solves
+      const allResults = handles.map(handle => ({
+        handle: handle,
+        rank: null,
+        solved: 0,
+        penalty: 0,
+        totalProblems: problemCount,
+        problemResults: []
+      }));
 
-            // Merge API results
-            if (data.result.rows && data.result.rows.length > 0) {
-              data.result.rows.forEach(row => {
-                const matchedHandle = handles.find(
-                  h => h.toLowerCase() === row.party.members[0].handle.toLowerCase()
-                );
-                if (matchedHandle) {
-                  const memberIndex = allResults.findIndex(
-                    r => r.handle.toLowerCase() === matchedHandle.toLowerCase()
-                  );
-                  if (memberIndex !== -1) {
-                    let solved = 0;
-                    const problemResults = [];
-                    if (row.problemResults && data.result.problems) {
-                      row.problemResults.forEach((pr, index) => {
-                        const isSolved = pr.points > 0;
-                        if (isSolved) {
-                          solved++;
-                          problemResults.push({
-                            index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
-                            solved: true,
-                            attempts: pr.rejectedAttempts || 0
-                          });
-                        } else {
-                          problemResults.push({
-                            index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
-                            solved: false,
-                            attempts: pr.rejectedAttempts || 0
-                          });
-                        }
-                      });
-                    }
-                    allResults[memberIndex] = {
-                      handle: matchedHandle,
-                      rank: phase === 'CODING' ? null : (row.rank || null),
-                      solved: solved,
-                      penalty: row.penalty || 0,
-                      totalProblems: problemCount,
-                      problemResults: problemResults
-                    };
+      // Merge API results
+      if (data.result.rows && data.result.rows.length > 0) {
+        data.result.rows.forEach(row => {
+          const matchedHandle = handles.find(
+            h => h.toLowerCase() === row.party.members[0].handle.toLowerCase()
+          );
+          if (matchedHandle) {
+            const memberIndex = allResults.findIndex(
+              r => r.handle.toLowerCase() === matchedHandle.toLowerCase()
+            );
+            if (memberIndex !== -1) {
+              let solved = 0;
+              const problemResults = [];
+              if (row.problemResults && data.result.problems) {
+                row.problemResults.forEach((pr, index) => {
+                  const isSolved = pr.points > 0;
+                  if (isSolved) {
+                    solved++;
+                    problemResults.push({
+                      index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
+                      solved: true,
+                      attempts: pr.rejectedAttempts || 0
+                    });
+                  } else {
+                    problemResults.push({
+                      index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
+                      solved: false,
+                      attempts: pr.rejectedAttempts || 0
+                    });
                   }
-                }
-              });
+                });
+              }
+              allResults[memberIndex] = {
+                handle: matchedHandle,
+                rank: phase === 'CODING' ? null : (row.rank || null),
+                solved: solved,
+                penalty: row.penalty || 0,
+                totalProblems: problemCount,
+                problemResults: problemResults
+              };
             }
-            
-            resolve({
-              success: true,
-              results: allResults,
-              totalProblems: problemCount,
-              phase: phase
-            });
-          } else {
-            resolve({ success: false, error: data?.comment || 'API returned invalid response' });
           }
-        })
-        .catch(error => {
-          clearTimeout(timeoutId);
-          resolve({ success: false, error: error.message });
         });
-    } catch (error) {
-      clearTimeout(timeoutId);
-      resolve({ success: false, error: error.message });
+      }
+      
+      return {
+        success: true,
+        results: allResults,
+        totalProblems: problemCount,
+        phase: phase
+      };
+    } else {
+      return { success: false, error: data?.comment || 'API returned invalid response' };
     }
-  });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 }
 
-// ─── compareContestEntries (fixed) ───────────────────────────────────────────
+// ─── compareContestEntries ───────────────────────────────────────────────────
 function compareContestEntries(a, b) {
   if (a.solved !== b.solved) return b.solved - a.solved;
   if (a.rank !== null && b.rank !== null && a.rank !== undefined && b.rank !== undefined) {
@@ -736,7 +726,7 @@ function compareContestEntries(a, b) {
   return a.handle.localeCompare(b.handle);
 }
 
-// ─── Fallback function (fixed) ──────────────────────────────────────────────
+// ─── Fallback function (using axios) ────────────────────────────────────────
 async function handleSlowFallback(sock, from, contestId, handles) {
   try {
     await sock.sendMessage(from, { text: '⏳ Using slow fallback method... This may take a moment.' });
@@ -748,15 +738,17 @@ async function handleSlowFallback(sock, from, contestId, handles) {
     
     const results = [];
     let totalProblems = 0;
-    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     
     for (let i = 0; i < handles.length; i++) {
       const handle = handles[i];
-      if (i > 0) await delay(500);
+      if (i > 0) await sleep(500);
       
       try {
-        const subResponse = await fetch(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`);
-        const subData = await subResponse.json();
+        const subResponse = await axios.get(
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+          { timeout: 15000 }
+        );
+        const subData = subResponse.data;
         if (subData.status === 'OK' && subData.result) {
           const contestSubmissions = subData.result.filter(sub => 
             sub.contestId == contestId &&
@@ -794,10 +786,12 @@ async function handleSlowFallback(sock, from, contestId, handles) {
     
     if (totalProblems === 0) {
       try {
-        const standingsResponse = await fetch(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`);
-        const standingsData = await standingsResponse.json();
-        if (standingsData.status === 'OK' && standingsData.result) {
-          totalProblems = standingsData.result.problems.length;
+        const standingsResponse = await axios.get(
+          `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+          { timeout: 8000 }
+        );
+        if (standingsResponse.data.status === 'OK' && standingsResponse.data.result) {
+          totalProblems = standingsResponse.data.result.problems.length;
         }
       } catch (error) {
         totalProblems = results.reduce((max, r) => Math.max(max, r.solved), 0);
