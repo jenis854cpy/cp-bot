@@ -374,7 +374,7 @@ async function getCodeChefUpcoming() {
       .sort((a, b) => a.startTime - b.startTime)
       .slice(0, 10)
       .map((c) => ({
-        id: `cc-${c.title.replace(/\s/g, '-')}`,
+        id: `cc-${c.title.replace(/[^a-zA-Z0-9]/g, '-')}`,
         platform: "CodeChef",
         name: c.title,
         startTimeSeconds: Math.floor(c.startTime / 1000),
@@ -382,6 +382,29 @@ async function getCodeChefUpcoming() {
         url: `https://www.codechef.com/${c.title}`,
       }));
   } catch { return []; }
+}
+
+// ─── NEW: AtCoder Upcoming ──────────────────────────────────────────────────
+async function getAtCoderUpcoming() {
+  try {
+    const res = await axios.get("https://competeapi.vercel.app/contests/upcoming/", { timeout: 10000 });
+    const now = Date.now();
+    return (res.data || [])
+      .filter((c) => c.site === "atcoder" && c.startTime > now)
+      .sort((a, b) => a.startTime - b.startTime)
+      .slice(0, 10)
+      .map((c) => ({
+        id: `at-${c.title.replace(/[^a-zA-Z0-9]/g, '-')}`,
+        platform: "AtCoder",
+        name: c.title,
+        startTimeSeconds: Math.floor(c.startTime / 1000),
+        durationSeconds: Math.floor(c.duration / 1000),
+        url: `https://atcoder.jp/contests/${c.title}`,
+      }));
+  } catch (e) {
+    console.error("AtCoder API error:", e.message);
+    return [];
+  }
 }
 
 async function getLeetCodeUpcoming() {
@@ -397,7 +420,7 @@ async function getLeetCodeUpcoming() {
       .sort((a, b) => a.startTime - b.startTime)
       .slice(0, 10)
       .map((c) => ({
-        id: `lc-${c.title.replace(/\s/g, '-')}`,
+        id: `lc-${c.title.replace(/[^a-zA-Z0-9]/g, '-')}`,
         platform: "LeetCode",
         name: c.title,
         startTimeSeconds: c.startTime,
@@ -410,12 +433,13 @@ async function getLeetCodeUpcoming() {
 // ─── Reminder System ──────────────────────────────────────────────────────────
 async function checkAndSendReminders(sock) {
   try {
-    const [cf, cc, lc] = await Promise.all([
+    const [cf, cc, lc, at] = await Promise.all([
       getCFUpcoming(),
       getCodeChefUpcoming(),
       getLeetCodeUpcoming(),
+      getAtCoderUpcoming(),
     ]);
-    const allContests = [...cf, ...cc, ...lc];
+    const allContests = [...cf, ...cc, ...lc, ...at];
     if (!allContests.length) return;
 
     console.log(`🔍 Checking ${allContests.length} upcoming contests...`);
@@ -436,7 +460,7 @@ async function checkAndSendReminders(sock) {
       for (const contest of allContests) {
         const diff = contest.startTimeSeconds - now;
         const minsLeft = Math.round(diff / 60);
-        console.log(`⏰ ${contest.name}: ${minsLeft} min left`);
+        console.log(`⏰ ${contest.platform} - ${contest.name}: ${minsLeft} min left`);
 
         // 1-day reminder: 23.5–24.5 hours
         if (diff >= 23.5 * 3600 && diff <= 24.5 * 3600) {
@@ -478,7 +502,9 @@ async function sendReminder(sock, chatId, contest, type) {
   }
 
   const emoji = contest.platform === "Codeforces" ? "🔵" :
-                contest.platform === "CodeChef" ? "🟤" : "🟡";
+                contest.platform === "CodeChef" ? "🟤" :
+                contest.platform === "LeetCode" ? "🟡" :
+                contest.platform === "AtCoder" ? "🟣" : "⚪";
 
   let message = `📢 *${contest.platform} Contest Reminder!*\n`;
   message += `${"─".repeat(28)}\n\n`;
@@ -1076,19 +1102,24 @@ async function startBot() {
         // ── // upcoming ──────────────────────────────────────────────────
         else if (command === "// upcoming") {
           await reply("⏳ Fetching upcoming contests from all platforms...");
-          const [cf, lc, cc] = await Promise.all([
+          const [cf, lc, cc, at] = await Promise.all([
             getCFUpcoming(),
             getLeetCodeUpcoming(),
             getCodeChefUpcoming(),
+            getAtCoderUpcoming(),
           ]);
-          const all = [...cf, ...lc, ...cc].slice(0, 8);
+          const all = [...cf, ...lc, ...cc, ...at]
+            .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
+            .slice(0, 8);
           let text = `📅 *Upcoming Contests*\n${"─".repeat(28)}\n\n`;
           if (!all.length) {
             text += `😴 No upcoming contests right now.`;
           } else {
             all.forEach((c) => {
               const emoji = c.platform === "Codeforces" ? "🔵" :
-                            c.platform === "CodeChef" ? "🟤" : "🟡";
+                            c.platform === "CodeChef" ? "🟤" :
+                            c.platform === "LeetCode" ? "🟡" :
+                            c.platform === "AtCoder" ? "🟣" : "⚪";
               text += `${emoji} *${c.platform}*\n`;
               text += `  • *${c.name}*\n    🕐 ${formatIST(c.startTimeSeconds)}\n    ⏱ ${formatDuration(c.durationSeconds)}\n    🔗 ${c.url}\n\n`;
             });
@@ -1447,7 +1478,7 @@ async function startBot() {
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 03 ]  CONTESTS*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
-            `📅 \`// upcoming\`\n   _Next CF, LC & CC contests_\n\n` +
+            `📅 \`// upcoming\`\n   _Next CF, LC, CC & AtCoder contests_\n\n` +
             `🧩 \`// solved\`\n   _Who solved what in last contest_\n\n` +
             `🏁 \`// contest <id>\`\n   _Group standings for any contest_\n   _eg. // contest 1790_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
