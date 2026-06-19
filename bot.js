@@ -384,25 +384,47 @@ async function getCodeChefUpcoming() {
   } catch { return []; }
 }
 
-// ─── NEW: AtCoder Upcoming ──────────────────────────────────────────────────
+// ─── NEW: AtCoder Upcoming (fixed version) ──────────────────────────────────
 async function getAtCoderUpcoming() {
   try {
     const res = await axios.get("https://competeapi.vercel.app/contests/upcoming/", { timeout: 10000 });
     const now = Date.now();
-    return (res.data || [])
-      .filter((c) => c.site === "atcoder" && c.startTime > now)
-      .sort((a, b) => a.startTime - b.startTime)
-      .slice(0, 10)
-      .map((c) => ({
-        id: `at-${c.title.replace(/[^a-zA-Z0-9]/g, '-')}`,
-        platform: "AtCoder",
-        name: c.title,
-        startTimeSeconds: Math.floor(c.startTime / 1000),
-        durationSeconds: Math.floor(c.duration / 1000),
-        url: `https://atcoder.jp/contests/${c.title}`,
-      }));
+
+    const atcoderContests = (res.data || []).filter(
+      (c) => c.site?.toLowerCase() === "atcoder"
+    );
+
+    console.log(`[AtCoder] Raw entries found: ${atcoderContests.length}`);
+    if (atcoderContests.length > 0) console.log(`[AtCoder] Sample:`, atcoderContests[0]);
+
+    const results = atcoderContests
+      .map((c) => {
+        // Field name variants
+        const title = c.title ?? c.name ?? c.event ?? "unknown";
+        let startTime = c.startTime ?? c.start ?? c.start_time ?? 0;
+        const duration = c.duration ?? c.length ?? 0;
+
+        // Auto‑detect ms vs seconds
+        if (startTime > 1e12) startTime = Math.floor(startTime / 1000);
+
+        return {
+          id: `at-${title.replace(/[^a-zA-Z0-9]/g, "-")}`,
+          platform: "AtCoder",
+          name: title,
+          startTimeSeconds: startTime,
+          durationSeconds: Math.floor(duration / 1000),
+          url: `https://atcoder.jp/contests/${title}`,
+        };
+      })
+      .filter((c) => c.startTimeSeconds > Math.floor(now / 1000))
+      .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
+      .slice(0, 10);
+
+    console.log(`[AtCoder] Returning ${results.length} upcoming contests`);
+    return results;
+
   } catch (e) {
-    console.error("AtCoder API error:", e.message);
+    console.error("[AtCoder] API error:", e.message);
     return [];
   }
 }
