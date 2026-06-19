@@ -384,34 +384,69 @@ async function getCodeChefUpcoming() {
   } catch { return []; }
 }
 
-// ─── NEW: AtCoder Upcoming (fixed version) ──────────────────────────────────
+// ─── AtCoder: Clist fallback ─────────────────────────────────────────────────
+async function getAtCoderFromClist() {
+  try {
+    const res = await axios.get("https://clist.by/api/v4/contest/", {
+      params: {
+        resource: "atcoder.jp",
+        start__gt: new Date().toISOString(),
+        order_by: "start",
+        limit: 10,
+        format: "json",
+      },
+      headers: { Authorization: "ApiKey jenis854cpy:fddfa6592cd15f600f7abadeb8c74b36836322b2" },
+      timeout: 10000,
+    });
+
+    return (res.data?.objects || []).map((c) => ({
+      id: `at-${c.id}`,
+      platform: "AtCoder",
+      name: c.event,
+      startTimeSeconds: Math.floor(new Date(c.start).getTime() / 1000),
+      durationSeconds: c.duration,
+      url: c.href,
+    }));
+  } catch (e) {
+    console.error("[AtCoder Clist] error:", e.message);
+    return [];
+  }
+}
+
+// ─── Primary AtCoder function ────────────────────────────────────────────────
 async function getAtCoderUpcoming() {
   try {
-    const res = await axios.get("https://competeapi.vercel.app/contests/upcoming/", { timeout: 10000 });
+    const res = await axios.get(
+      "https://competeapi.vercel.app/contests/upcoming/",
+      { timeout: 10000 }
+    );
     const now = Date.now();
 
-    const atcoderContests = (res.data || []).filter(
+    const raw = (res.data || []).filter(
       (c) => c.site?.toLowerCase() === "atcoder"
     );
 
-    console.log(`[AtCoder] Raw entries found: ${atcoderContests.length}`);
-    if (atcoderContests.length > 0) console.log(`[AtCoder] Sample:`, atcoderContests[0]);
+    console.log(`[AtCoder] competeapi entries: ${raw.length}`);
+    if (raw.length > 0) console.log("[AtCoder] Sample:", raw[0]);
 
-    const results = atcoderContests
+    if (raw.length === 0) {
+      console.log("[AtCoder] Falling back to Clist...");
+      return await getAtCoderFromClist();
+    }
+
+    return raw
       .map((c) => {
-        // Field name variants
-        const title = c.title ?? c.name ?? c.event ?? "unknown";
-        let startTime = c.startTime ?? c.start ?? c.start_time ?? 0;
+        const title    = c.title ?? c.name ?? c.event ?? "unknown";
+        let   start    = c.startTime ?? c.start ?? c.start_time ?? 0;
         const duration = c.duration ?? c.length ?? 0;
 
-        // Auto‑detect ms vs seconds
-        if (startTime > 1e12) startTime = Math.floor(startTime / 1000);
+        if (start > 1e12) start = Math.floor(start / 1000); // ms → s
 
         return {
           id: `at-${title.replace(/[^a-zA-Z0-9]/g, "-")}`,
           platform: "AtCoder",
           name: title,
-          startTimeSeconds: startTime,
+          startTimeSeconds: start,
           durationSeconds: Math.floor(duration / 1000),
           url: `https://atcoder.jp/contests/${title}`,
         };
@@ -420,12 +455,9 @@ async function getAtCoderUpcoming() {
       .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
       .slice(0, 10);
 
-    console.log(`[AtCoder] Returning ${results.length} upcoming contests`);
-    return results;
-
   } catch (e) {
-    console.error("[AtCoder] API error:", e.message);
-    return [];
+    console.error("[AtCoder] Primary API error:", e.message);
+    return getAtCoderFromClist();
   }
 }
 
@@ -1130,22 +1162,43 @@ async function startBot() {
             getCodeChefUpcoming(),
             getAtCoderUpcoming(),
           ]);
-          const all = [...cf, ...lc, ...cc, ...at]
-            .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
-            .slice(0, 8);
+
+          // Group by platform
+          const grouped = {};
+          const all = [...cf, ...lc, ...cc, ...at];
+          for (const c of all) {
+            if (!grouped[c.platform]) grouped[c.platform] = [];
+            grouped[c.platform].push(c);
+          }
+
+          // Sort contests within each platform by start time
+          for (const platform of Object.keys(grouped)) {
+            grouped[platform].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+          }
+
+          const platformOrder = ["Codeforces", "LeetCode", "CodeChef", "AtCoder"];
+
           let text = `📅 *Upcoming Contests*\n${"─".repeat(28)}\n\n`;
-          if (!all.length) {
-            text += `😴 No upcoming contests right now.`;
-          } else {
-            all.forEach((c) => {
-              const emoji = c.platform === "Codeforces" ? "🔵" :
-                            c.platform === "CodeChef" ? "🟤" :
-                            c.platform === "LeetCode" ? "🟡" :
-                            c.platform === "AtCoder" ? "🟣" : "⚪";
-              text += `${emoji} *${c.platform}*\n`;
+          let anyContest = false;
+
+          for (const platform of platformOrder) {
+            const contests = grouped[platform] || [];
+            if (contests.length === 0) continue;
+            anyContest = true;
+            const emoji = platform === "Codeforces" ? "🔵" :
+                          platform === "CodeChef" ? "🟤" :
+                          platform === "LeetCode" ? "🟡" :
+                          platform === "AtCoder" ? "🟣" : "⚪";
+            text += `${emoji} *${platform}*\n`;
+            contests.slice(0, 8).forEach((c) => {
               text += `  • *${c.name}*\n    🕐 ${formatIST(c.startTimeSeconds)}\n    ⏱ ${formatDuration(c.durationSeconds)}\n    🔗 ${c.url}\n\n`;
             });
           }
+
+          if (!anyContest) {
+            text += `😴 No upcoming contests right now.`;
+          }
+
           await reply(text.trim());
         }
 
