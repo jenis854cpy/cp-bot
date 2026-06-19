@@ -395,7 +395,7 @@ async function getAtCoderFromClist() {
         limit: 10,
         format: "json",
       },
-      headers: { Authorization: "ApiKey jenis854cpy:fddfa6592cd15f600f7abadeb8c74b36836322b2" },
+      headers: { Authorization: "ApiKey jenis854cpy:YOUR_API_KEY" }, // replace with your key
       timeout: 10000,
     });
 
@@ -577,198 +577,251 @@ async function sendReminder(sock, chatId, contest, type) {
   }
 }
 
-// ─── Sorting comparator ──────────────────────────────────────────────────────
-function compareContestEntries(a, b) {
-  const aData = a[1];
-  const bData = b[1];
-
-  // 1. More solves first
-  if (bData.solved !== aData.solved) return bData.solved - aData.solved;
-
-  // 2. Rank — ONLY when BOTH have a rank (finished rated contest)
-  const aRank = aData.rank;
-  const bRank = bData.rank;
-  if (aRank !== null && bRank !== null && aRank !== bRank) return aRank - bRank;
-
-  // 3. Penalty ascending (live / unrated)
-  const aPenalty = aData.penalty ?? Infinity;
-  const bPenalty = bData.penalty ?? Infinity;
-  if (aPenalty !== bPenalty) return aPenalty - bPenalty;
-
-  // 4. Alphabetical tiebreaker
-  return a[0].localeCompare(b[0]);
+// ─── Helper functions for // solved ──────────────────────────────────────────
+function formatDuration(seconds) {
+  if (!seconds || seconds < 0 || isNaN(seconds)) return 'N/A';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours === 0 && minutes === 0) return '0m';
+  if (hours === 0) return `${minutes}m`;
+  if (minutes === 0) return `${hours}h`;
+  return `${hours}h ${minutes}m`;
 }
 
-// ─── getContestStandings (rank from standings is primary, never overwritten) ──
-async function getContestStandings(contestId, handles, contestInfo) {
-  if (!handles || handles.length === 0) return {};
-
-  const lowerToOriginal = {};
-  for (const h of handles) {
-    lowerToOriginal[h.toLowerCase()] = h;
+function getProblemLabels(count) {
+  if (!count || count < 1) return '';
+  const labels = [];
+  for (let i = 0; i < count; i++) {
+    let label = '';
+    let n = i;
+    let safety = 0;
+    while (n >= 0 && safety < 10) {
+      label = String.fromCharCode(65 + (n % 26)) + label;
+      n = Math.floor(n / 26) - 1;
+      safety++;
+    }
+    labels.push(label);
   }
+  return labels.join(' ');
+}
 
-  // Initialize map with rank: null, penalty: 0
-  const solvedMap = {};
-  for (const h of handles) {
-    solvedMap[h] = { solved: 0, rank: null, penalty: 0 };
-  }
-
-  let standingsWorked = false;
-
-  // ─── PRIMARY: contest.standings (rank is reliable, available immediately) ──
+async function getContestInfo(contestId) {
   try {
-    const res = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handles.join(';')}&showUnofficial=false`,
-      { timeout: 30000 }
-    );
-    if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.rows) {
-      const rows = res.data.result.rows.filter(
-        row => row.party.participantType === 'CONTESTANT'
-      );
-      if (rows.length > 0) {
-        standingsWorked = true;
-        for (const row of rows) {
-          const memberHandles = row.party.members.map(m => m.handle);
-          const acceptedCount = row.problemResults.filter(
-            p => p.bestSubmissionTimeSeconds !== undefined && p.bestSubmissionTimeSeconds > 0
-          ).length;
-          const rank = row.rank || null;
-          const penalty = row.penalty || 0;
-          for (const apiHandle of memberHandles) {
-            const lower = apiHandle.toLowerCase();
-            const original = lowerToOriginal[lower];
-            if (original) {
-              solvedMap[original].solved = acceptedCount;
-              solvedMap[original].rank = rank;          // ← rank from standings
-              solvedMap[original].penalty = penalty;
-            }
-          }
-        }
-      }
+    const response = await fetch(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`);
+    const data = await response.json();
+    if (data && data.status === 'OK' && data.result && data.result.contest) {
+      return data.result.contest;
     }
-  } catch (e) {
-    console.error(`Standings fetch failed for ${contestId}:`, e.message);
+    return { 
+      name: `Codeforces Round #${contestId}`, 
+      startTimeSeconds: 0, 
+      durationSeconds: 7200 
+    };
+  } catch {
+    return { 
+      name: `Codeforces Round #${contestId}`, 
+      startTimeSeconds: 0, 
+      durationSeconds: 7200 
+    };
   }
+}
 
-  // ─── SECONDARY: ratingChanges (only fills missing rank, never overwrites) ──
-  if (standingsWorked) {
+// ─── getContestStandings (fixed) ─────────────────────────────────────────────
+async function getContestStandings(contestId, handles) {
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      resolve({ success: false, error: 'Request timeout' });
+    }, 12000);
+
     try {
-      const res = await axios.get(
-        `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
-        { timeout: 30000 }
-      );
-      if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.length > 0) {
-        const changeMap = {};
-        for (const entry of res.data.result) {
-          changeMap[entry.handle.toLowerCase()] = entry;
-        }
-        for (const handle of handles) {
-          const entry = changeMap[handle.toLowerCase()];
-          if (entry && solvedMap[handle] && solvedMap[handle].rank === null) {
-            solvedMap[handle].rank = entry.rank;       // only if standings didn't give rank
-          }
-        }
-      }
-    } catch (e) {
-      // ratingChanges fails → standings rank preserved (fine)
-      console.log(`No rating changes for contest ${contestId} (unrated or delayed)`);
-    }
-  }
+      const handlesParam = Array.isArray(handles) ? handles.join(';') : handles;
+      const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000`;
+      
+      fetch(url)
+        .then(response => response.json())
+        .then(data => {
+          clearTimeout(timeoutId);
+          
+          if (data && data.status === 'OK' && data.result) {
+            const problemCount = data.result.problems ? data.result.problems.length : 0;
+            const phase = data.result.contest ? data.result.contest.phase : 'FINISHED';
+            
+            // Initialize ALL members with 0 solves
+            const allResults = handles.map(handle => ({
+              handle: handle,
+              rank: null,
+              solved: 0,
+              penalty: 0,
+              totalProblems: problemCount,
+              problemResults: []
+            }));
 
-  // ─── FALLBACK (if standings failed entirely) ──────────────────────────────
-  if (!standingsWorked) {
-    console.log(`🔄 Standings API failed; falling back to per‑user submissions for contest ${contestId}`);
-
-    let contestStart = 0, contestEnd = Infinity;
-    if (contestInfo && contestInfo.startTimeSeconds && contestInfo.durationSeconds) {
-      contestStart = contestInfo.startTimeSeconds;
-      contestEnd = contestInfo.startTimeSeconds + contestInfo.durationSeconds;
-    } else {
-      try {
-        const details = await getContestDetails(contestId);
-        if (details && details.contest) {
-          contestStart = details.contest.startTimeSeconds || 0;
-          contestEnd = contestStart + (details.contest.durationSeconds || 0);
-        }
-      } catch (_) {}
-    }
-
-    let problemKeys = new Set();
-    try {
-      const details = await getContestDetails(contestId);
-      if (details && details.problems) {
-        for (const p of details.problems) {
-          problemKeys.add(`${contestId}-${p.index.toUpperCase()}`);
-        }
-      }
-    } catch (_) {}
-
-    const useContestIdOnly = problemKeys.size === 0;
-
-    for (let i = 0; i < handles.length; i += 2) {
-      const batch = handles.slice(i, i + 2);
-      const batchResults = await Promise.all(batch.map(async (handle) => {
-        try {
-          const res = await axios.get(
-            `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-            { timeout: 20000 }
-          );
-          const subs = res.data.result || [];
-          const solved = new Set();
-          for (const s of subs) {
-            if (s.verdict === "OK" && s.problem) {
-              const subTime = s.creationTimeSeconds;
-              if (subTime >= contestStart && subTime <= contestEnd) {
-                if (useContestIdOnly) {
-                  if (Number(s.problem.contestId) === Number(contestId)) {
-                    solved.add(s.problem.index.toUpperCase());
+            // Merge API results
+            if (data.result.rows && data.result.rows.length > 0) {
+              data.result.rows.forEach(row => {
+                const matchedHandle = handles.find(
+                  h => h.toLowerCase() === row.party.members[0].handle.toLowerCase()
+                );
+                if (matchedHandle) {
+                  const memberIndex = allResults.findIndex(
+                    r => r.handle.toLowerCase() === matchedHandle.toLowerCase()
+                  );
+                  if (memberIndex !== -1) {
+                    let solved = 0;
+                    const problemResults = [];
+                    if (row.problemResults && data.result.problems) {
+                      row.problemResults.forEach((pr, index) => {
+                        const isSolved = pr.points > 0;
+                        if (isSolved) {
+                          solved++;
+                          problemResults.push({
+                            index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
+                            solved: true,
+                            attempts: pr.rejectedAttempts || 0
+                          });
+                        } else {
+                          problemResults.push({
+                            index: data.result.problems[index]?.index || String.fromCharCode(65 + index),
+                            solved: false,
+                            attempts: pr.rejectedAttempts || 0
+                          });
+                        }
+                      });
+                    }
+                    allResults[memberIndex] = {
+                      handle: matchedHandle,
+                      rank: phase === 'CODING' ? null : (row.rank || null),
+                      solved: solved,
+                      penalty: row.penalty || 0,
+                      totalProblems: problemCount,
+                      problemResults: problemResults
+                    };
                   }
-                } else {
-                  const key = `${s.problem.contestId}-${s.problem.index.toUpperCase()}`;
-                  if (problemKeys.has(key)) solved.add(key);
                 }
-              }
+              });
             }
+            
+            resolve({
+              success: true,
+              results: allResults,
+              totalProblems: problemCount,
+              phase: phase
+            });
+          } else {
+            resolve({ success: false, error: data?.comment || 'API returned invalid response' });
           }
-          return { handle, count: solved.size };
-        } catch (e) {
-          return { handle, count: 0 };
-        }
-      }));
-      for (const r of batchResults) {
-        if (solvedMap[r.handle]) {
-          solvedMap[r.handle].solved = r.count;
-          // rank stays null (no penalty either)
-        }
-      }
-      if (i + 2 < handles.length) await sleep(1500);
+        })
+        .catch(error => {
+          clearTimeout(timeoutId);
+          resolve({ success: false, error: error.message });
+        });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      resolve({ success: false, error: error.message });
     }
+  });
+}
 
-    // Optionally try to get ranks from ratingChanges if standings failed
-    if (!standingsWorked) {
-      try {
-        const res = await axios.get(
-          `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
-          { timeout: 15000 }
-        );
-        if (res.data && res.data.status === 'OK' && res.data.result && res.data.result.length > 0) {
-          const changeMap = {};
-          for (const entry of res.data.result) {
-            changeMap[entry.handle.toLowerCase()] = entry;
-          }
-          for (const handle of handles) {
-            const entry = changeMap[handle.toLowerCase()];
-            if (entry && solvedMap[handle]) {
-              solvedMap[handle].rank = entry.rank;
-            }
-          }
-        }
-      } catch (_) {}
-    }
+// ─── compareContestEntries (fixed) ───────────────────────────────────────────
+function compareContestEntries(a, b) {
+  if (a.solved !== b.solved) return b.solved - a.solved;
+  if (a.rank !== null && b.rank !== null && a.rank !== undefined && b.rank !== undefined) {
+    return a.rank - b.rank;
   }
+  if ((a.rank === null || a.rank === undefined) && (b.rank === null || b.rank === undefined)) {
+    if (a.penalty !== b.penalty) return a.penalty - b.penalty;
+  }
+  if (a.rank === null || a.rank === undefined) return 1;
+  if (b.rank === null || b.rank === undefined) return -1;
+  return a.handle.localeCompare(b.handle);
+}
 
-  return solvedMap;
+// ─── Fallback function (fixed) ──────────────────────────────────────────────
+async function handleSlowFallback(sock, from, contestId, handles) {
+  try {
+    await sock.sendMessage(from, { text: '⏳ Using slow fallback method... This may take a moment.' });
+
+    const contestInfo = await getContestInfo(contestId);
+    const startTime = contestInfo.startTimeSeconds || 0;
+    const duration = contestInfo.durationSeconds || 7200;
+    const endTime = startTime + duration;
+    
+    const results = [];
+    let totalProblems = 0;
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    
+    for (let i = 0; i < handles.length; i++) {
+      const handle = handles[i];
+      if (i > 0) await delay(500);
+      
+      try {
+        const subResponse = await fetch(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`);
+        const subData = await subResponse.json();
+        if (subData.status === 'OK' && subData.result) {
+          const contestSubmissions = subData.result.filter(sub => 
+            sub.contestId == contestId &&
+            sub.creationTimeSeconds >= startTime &&
+            sub.creationTimeSeconds <= endTime
+          );
+          if (contestSubmissions.length > 0) {
+            const problemIndexes = contestSubmissions.map(s => s.problem.index);
+            const uniqueProblems = new Set(problemIndexes);
+            totalProblems = Math.max(totalProblems, uniqueProblems.size);
+          }
+          const solvedProblems = new Set();
+          let penalty = 0;
+          const sortedSubs = contestSubmissions.sort((a, b) => a.creationTimeSeconds - b.creationTimeSeconds);
+          const attempts = {};
+          for (const sub of sortedSubs) {
+            const problemId = sub.problem.index;
+            if (sub.verdict === 'OK' && !solvedProblems.has(problemId)) {
+              solvedProblems.add(problemId);
+              const timeFromStart = sub.creationTimeSeconds - startTime;
+              const wrongAttempts = attempts[problemId] || 0;
+              penalty += Math.floor(timeFromStart / 60) + (wrongAttempts * 20);
+            } else if (sub.verdict !== 'OK' && !solvedProblems.has(problemId)) {
+              attempts[problemId] = (attempts[problemId] || 0) + 1;
+            }
+          }
+          results.push({ handle, rank: null, solved: solvedProblems.size, penalty, totalProblems: 0 });
+        } else {
+          results.push({ handle, rank: null, solved: 0, penalty: 0, totalProblems: 0 });
+        }
+      } catch (error) {
+        results.push({ handle, rank: null, solved: 0, penalty: 0, totalProblems: 0 });
+      }
+    }
+    
+    if (totalProblems === 0) {
+      try {
+        const standingsResponse = await fetch(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`);
+        const standingsData = await standingsResponse.json();
+        if (standingsData.status === 'OK' && standingsData.result) {
+          totalProblems = standingsData.result.problems.length;
+        }
+      } catch (error) {
+        totalProblems = results.reduce((max, r) => Math.max(max, r.solved), 0);
+      }
+    }
+    
+    results.forEach(r => r.totalProblems = totalProblems);
+    results.sort(compareContestEntries);
+    
+    const hasSolves = results.some(r => r.solved > 0);
+    if (!hasSolves) {
+      await sock.sendMessage(from, { text: `😴 No group members have participated yet.\n\nContest: #${contestId}` });
+      return;
+    }
+    
+    let output = `⚠️ *Fallback Results* (API unavailable)\n📝 Problems: ${totalProblems}\n────────────────────────────\n\n`;
+    results.forEach((entry, index) => {
+      output += `${index + 1}. *${entry.handle}* — ✅ ${entry.solved}/${totalProblems} solved | Unrated\n`;
+    });
+    await sock.sendMessage(from, { text: output });
+  } catch (error) {
+    console.error('Fallback error:', error);
+    await sock.sendMessage(from, { text: '❌ Fallback method failed. Please try again later.' });
+  }
 }
 
 // ─── Winner Checker + Promotion Checker ──────────────────────────────────────
@@ -791,19 +844,17 @@ async function checkAndAnnounceWinner(sock) {
         const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
         const now = Math.floor(Date.now() / 1000);
         if (now - finishedAt <= 7200) {
-          const solvedMap = await getContestStandings(lastId, handles, lastContest);
-          if (solvedMap) {
-            const entries = Object.entries(solvedMap)
-              .filter(([, data]) => data.solved > 0)
-              .sort(compareContestEntries);
+          const { success, results } = await getContestStandings(lastId, handles);
+          if (success && results) {
+            const entries = results.filter(r => r.solved > 0).sort(compareContestEntries);
             if (entries.length) {
-              const [winner, winnerData] = entries[0];
+              const [winner] = entries;
               let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
-              text += `🏆 *Group Winner: ${winner}* with *${winnerData.solved}* solved${winnerData.rank ? ` (Rank #${winnerData.rank})` : ''}!\n\n📊 *Group Performance:*\n`;
-              entries.forEach(([h, data], i) => {
+              text += `🏆 *Group Winner: ${winner.handle}* with *${winner.solved}* solved${winner.rank ? ` (Rank #${winner.rank})` : ''}!\n\n📊 *Group Performance:*\n`;
+              entries.forEach((r, i) => {
                 const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-                const rankStr = data.rank ? ` | Rank #${data.rank}` : ' | Unrated';
-                text += `${medal} *${h}* — ✅ ${data.solved} solved${rankStr}\n`;
+                const rankStr = r.rank ? ` | Rank #${r.rank}` : ' | Unrated';
+                text += `${medal} *${r.handle}* — ✅ ${r.solved} solved${rankStr}\n`;
               });
               await sock.sendMessage(chatId, { text });
             }
@@ -997,12 +1048,6 @@ function streakFire(days) {
   return "💤";
 }
 
-function formatDuration(seconds) {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
 function formatIST(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleString("en-IN", {
     timeZone: "Asia/Kolkata", day: "2-digit", month: "short",
@@ -1163,24 +1208,19 @@ async function startBot() {
             getAtCoderUpcoming(),
           ]);
 
-          // Group by platform
           const grouped = {};
           const all = [...cf, ...lc, ...cc, ...at];
           for (const c of all) {
             if (!grouped[c.platform]) grouped[c.platform] = [];
             grouped[c.platform].push(c);
           }
-
-          // Sort contests within each platform by start time
           for (const platform of Object.keys(grouped)) {
             grouped[platform].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
           }
 
           const platformOrder = ["Codeforces", "LeetCode", "CodeChef", "AtCoder"];
-
           let text = `📅 *Upcoming Contests*\n${"─".repeat(28)}\n\n`;
           let anyContest = false;
-
           for (const platform of platformOrder) {
             const contests = grouped[platform] || [];
             if (contests.length === 0) continue;
@@ -1194,11 +1234,7 @@ async function startBot() {
               text += `  • *${c.name}*\n    🕐 ${formatIST(c.startTimeSeconds)}\n    ⏱ ${formatDuration(c.durationSeconds)}\n    🔗 ${c.url}\n\n`;
             });
           }
-
-          if (!anyContest) {
-            text += `😴 No upcoming contests right now.`;
-          }
-
+          if (!anyContest) text += `😴 No upcoming contests right now.`;
           await reply(text.trim());
         }
 
@@ -1214,32 +1250,39 @@ async function startBot() {
             await reply(`⚠️ Could not detect the latest contest automatically (CF API may be down).\nPlease use \`// contest <id>\` to check standings manually.`);
             continue;
           }
-          await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take 10-20 seconds_`);
-          const solvedMap = await getContestStandings(contest.id, handles, contest);
-          if (!solvedMap) {
-            await reply(`❌ Could not fetch standings for contest ${contest.id}. Please try again later.`);
+
+          await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take a few seconds_`);
+
+          const { success, results, totalProblems, phase } = await getContestStandings(contest.id, handles);
+          const isLiveContest = phase === 'CODING';
+
+          if (!success) {
+            // ✅ API genuinely failed – fallback to per‑member submission scan
+            await handleSlowFallback(sock, chatId, contest.id, handles);
             continue;
           }
+
+          // ✅ API succeeded (even with 0 solves)
+          const participants = results.filter(r => r.solved > 0).sort(compareContestEntries);
+
           const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
-          const participated = Object.entries(solvedMap)
-            .filter(([, data]) => data.solved > 0)
-            .sort(compareContestEntries);
 
-          let text = `${isLive ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
+          let text = `${isLiveContest ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
           text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
 
-          if (!participated.length) {
+          if (!participants.length) {
             text += `😴 No group members have participated yet.`;
           } else {
-            participated.forEach(([h, data], i) => {
-              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              const rankStr = data.rank ? ` | Rank #${data.rank}` : ' | Unrated';
-              text += `${medal} *${h}* — ✅ ${data.solved}${totalProblems ? `/${totalProblems}` : ''} solved${rankStr}\n`;
+            const medals = ['🥇', '🥈', '🥉'];
+            participants.forEach((r, i) => {
+              const prefix = medals[i] ?? ` ${i + 1}.`;
+              const rankStr = isLiveContest ? 'Unrated' : (r.rank ? `Rank #${r.rank}` : 'Unrated');
+              text += `${prefix} *${r.handle}* — ✅ ${r.solved}${totalProblems ? `/${totalProblems}` : ''} solved | ${rankStr}\n`;
             });
           }
           await reply(text.trim());
@@ -1270,7 +1313,6 @@ async function startBot() {
           }
 
           let contestInfo = null;
-
           try {
             const list = await getCFContestList();
             const found = list.find(c => c.id == contestId);
@@ -1299,8 +1341,8 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take a few seconds_`);
 
-          const solvedMap = await getContestStandings(contestId, handles, contestInfo);
-          if (!solvedMap) {
+          const { success, results } = await getContestStandings(contestId, handles);
+          if (!success || !results) {
             await reply(`❌ Could not fetch standings for contest ${contestId}. Please try again later.`);
             continue;
           }
@@ -1309,9 +1351,7 @@ async function startBot() {
           const totalProblems = problems ? problems.length : 0;
           const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
 
-          const participated = Object.entries(solvedMap)
-            .filter(([, data]) => data.solved > 0)
-            .sort(compareContestEntries);
+          const participants = results.filter(r => r.solved > 0).sort(compareContestEntries);
 
           const now = Math.floor(Date.now() / 1000);
           let statusEmoji = "📊";
@@ -1325,13 +1365,14 @@ async function startBot() {
           if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
           text += `${"─".repeat(28)}\n\n`;
 
-          if (!participated.length) {
+          if (!participants.length) {
             text += `😴 No group members participated in this contest.`;
           } else {
-            participated.forEach(([h, data], i) => {
-              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              const rankStr = data.rank ? ` | Rank #${data.rank}` : ' | Unrated';
-              text += `${medal} *${h}* — ✅ ${data.solved}${totalProblems ? `/${totalProblems}` : ''} solved${rankStr}\n`;
+            const medals = ['🥇', '🥈', '🥉'];
+            participants.forEach((r, i) => {
+              const prefix = medals[i] ?? ` ${i + 1}.`;
+              const rankStr = r.rank ? `Rank #${r.rank}` : 'Unrated';
+              text += `${prefix} *${r.handle}* — ✅ ${r.solved}${totalProblems ? `/${totalProblems}` : ''} solved | ${rankStr}\n`;
             });
           }
           text += `\n🔗 https://codeforces.com/contest/${contestId}`;
