@@ -382,8 +382,9 @@ async function getCFContestList() {
 
 async function getContestInfo(contestId) {
   try {
+    // ✅ FIX: Added from=1&count=1&showUnofficial=true
     const response = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}`,
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1&showUnofficial=true`,
       { timeout: 10000 }
     );
     if (response.data.status === 'OK') {
@@ -391,7 +392,7 @@ async function getContestInfo(contestId) {
       const problems = response.data.result.problems || [];
       contest.problems = problems.length;
       contest.problemList = problems.map(p => p.index);
-      console.log(`📝 Contest ${contestId} has ${contest.problems} problems`);
+      console.log(`📝 Contest ${contestId} has ${contest.problems} problems:`, contest.problemList.join(' '));
       return contest;
     }
     return null;
@@ -401,7 +402,7 @@ async function getContestInfo(contestId) {
   }
 }
 
-// ─── Upcoming Contests (existing) ──────────────────────────────────────────
+// ─── Upcoming Contests ──────────────────────────────────────────────────────────
 async function getCFUpcoming() {
   try {
     const list = await getCFContestList();
@@ -645,7 +646,7 @@ function formatIST(unixSeconds) {
   }) + " IST";
 }
 
-// ─── NEW HELPER: getProblemLabels ────────────────────────────────────────────
+// ─── HELPER: getProblemLabels ────────────────────────────────────────────
 function getProblemLabels(count) {
   if (!count || count < 1) return '';
   const labels = [];
@@ -804,10 +805,20 @@ async function tier2FullStandings(contestId, handles) {
     
     const result = data.result;
     const problems = result.problems || [];
-    const totalProblems = problems.length;
+    let totalProblems = problems.length;
     const contest = result.contest;
     const phase = contest?.phase || 'FINISHED';
     const rows = result.rows || [];
+    
+    // ✅ FIX: If problems array is empty, try to get it from getContestInfo
+    if (totalProblems === 0) {
+      console.log(`⚠️ No problems found in API response, fetching from getContestInfo...`);
+      const contestInfo = await getContestInfo(contestId);
+      if (contestInfo && contestInfo.problems > 0) {
+        totalProblems = contestInfo.problems;
+        console.log(`✅ Got ${totalProblems} problems from getContestInfo`);
+      }
+    }
     
     console.log(`📝 Found ${totalProblems} problems`);
     
@@ -833,7 +844,7 @@ async function tier2FullStandings(contestId, handles) {
       return map[key] || { handle: h, rank: null, solved: 0, penalty: 0, totalProblems };
     });
     
-    console.log(`✅ Tier 2 found ${results.filter(r => r.solved > 0).length} participants`);
+    console.log(`✅ Tier 2 found ${results.filter(r => r.solved > 0).length} participants with solves`);
     
     return { success: true, results, totalProblems, phase, contest, source: 'full' };
   } catch (e) {
@@ -874,6 +885,15 @@ async function tier3BatchProcessing(contestId, handles, batchSize = 20) {
       
       if (!totalProblems) {
         totalProblems = problems.length;
+        // ✅ FIX: If problems array is empty, try to get it from getContestInfo
+        if (totalProblems === 0) {
+          console.log(`⚠️ No problems found in batch, fetching from getContestInfo...`);
+          const contestInfo = await getContestInfo(contestId);
+          if (contestInfo && contestInfo.problems > 0) {
+            totalProblems = contestInfo.problems;
+            console.log(`✅ Got ${totalProblems} problems from getContestInfo`);
+          }
+        }
         phase = result.contest?.phase || 'FINISHED';
         contest = result.contest;
       }
@@ -944,6 +964,15 @@ async function tier4IndividualRequests(contestId, handles) {
         const problems = result.problems || [];
         if (!totalProblems) {
           totalProblems = problems.length;
+          // ✅ FIX: If problems array is empty, try to get it from getContestInfo
+          if (totalProblems === 0) {
+            console.log(`⚠️ No problems found in individual, fetching from getContestInfo...`);
+            const contestInfo = await getContestInfo(contestId);
+            if (contestInfo && contestInfo.problems > 0) {
+              totalProblems = contestInfo.problems;
+              console.log(`✅ Got ${totalProblems} problems from getContestInfo`);
+            }
+          }
           phase = result.contest?.phase || 'FINISHED';
           contest = result.contest;
         }
