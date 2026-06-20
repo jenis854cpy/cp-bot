@@ -634,6 +634,13 @@ function getProblemLabels(count) {
   return labels.join(' ');
 }
 
+// ─── Ordinal helper for ranking ──────────────────────────────────────────────
+function ordinal(n) {
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 // ─── getContestInfo (using axios) ────────────────────────────────────────────
 async function getContestInfo(contestId) {
   try {
@@ -1328,14 +1335,14 @@ async function startBot() {
             continue;
           }
 
-          const { results, phase } = standingsResult;   // ← removed 'totalProblems' from here
+          const { results, phase } = standingsResult;
           const isLiveContest = phase === 'CODING';
           const participants = results.filter(r => r.solved > 0).sort(compareContestEntries);
 
           // Get problem details for the contest (to show letters & count)
           const details = await getContestDetails(contest.id);
           const problems = details.problems || [];
-          const totalProblems = problems.length;          // ← this is the only declaration now
+          const totalProblems = problems.length;
           const problemLetters = problems.map(p => p.index).join(" ");
 
           let text = `${isLiveContest ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
@@ -1347,11 +1354,14 @@ async function startBot() {
           if (!participants.length) {
             text += `😴 No group members have participated yet.`;
           } else {
+            // --- FORMAT WITH MEDALS + ORDINAL + CAPITAL Q ---
             const medals = ['🥇', '🥈', '🥉'];
             participants.forEach((r, i) => {
-              const prefix = medals[i] ?? ` ${i + 1}.`;
-              const rankStr = isLiveContest ? 'Unrated' : (r.rank ? `Rank #${r.rank}` : 'Unrated');
-              text += `${prefix} *${r.handle}* — ✅ ${r.solved}${totalProblems ? `/${totalProblems}` : ''} solved | ${rankStr}\n`;
+              const solved = r.solved;
+              const total = totalProblems || '?';
+              const rankDisplay = isLiveContest ? 'Unrated' : (r.rank || 'Unrated');
+              const medal = i < 3 ? medals[i] : '';
+              text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${solved}/${total} Q) (${rankDisplay} rank)\n`;
             });
           }
           await reply(text.trim());
@@ -1437,11 +1447,14 @@ async function startBot() {
           if (!participants.length) {
             text += `😴 No group members participated in this contest.`;
           } else {
+            // --- FORMAT WITH MEDALS + ORDINAL + CAPITAL Q ---
             const medals = ['🥇', '🥈', '🥉'];
             participants.forEach((r, i) => {
-              const prefix = medals[i] ?? ` ${i + 1}.`;
-              const rankStr = r.rank ? `Rank #${r.rank}` : 'Unrated';
-              text += `${prefix} *${r.handle}* — ✅ ${r.solved}${totalProblems ? `/${totalProblems}` : ''} solved | ${rankStr}\n`;
+              const solved = r.solved;
+              const total = totalProblems || '?';
+              const rankDisplay = r.rank || 'Unrated';
+              const medal = i < 3 ? medals[i] : '';
+              text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${solved}/${total} Q) (${rankDisplay} rank)\n`;
             });
           }
           text += `\n🔗 https://codeforces.com/contest/${contestId}`;
