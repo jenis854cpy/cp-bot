@@ -1289,13 +1289,15 @@ async function startBot() {
             continue;
           }
 
-          const { results, totalProblems, phase } = standingsResult;
+          const { results, phase } = standingsResult;   // ← removed 'totalProblems' from here
           const isLiveContest = phase === 'CODING';
           const participants = results.filter(r => r.solved > 0).sort(compareContestEntries);
 
-          const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
-          const totalProblems = problems ? problems.length : 0;
-          const problemLetters = problems ? problems.map((p) => p.index).join(" ") : "";
+          // Get problem details for the contest (to show letters & count)
+          const details = await getContestDetails(contest.id);
+          const problems = details.problems || [];
+          const totalProblems = problems.length;          // ← this is the only declaration now
+          const problemLetters = problems.map(p => p.index).join(" ");
 
           let text = `${isLiveContest ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
