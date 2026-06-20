@@ -1236,10 +1236,29 @@ async function startBot() {
         else if (command === "// solved") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          await reply("🔍 Detecting current/recent contest...");
-          let contest = await getRunningContest();
-          let isLive = !!contest;
-          if (!contest) contest = await getRecentFinishedContest();
+
+          // ── 1. Get the latest running or finished contest (sorted) ──
+          let contest = null;
+          let isLive = false;
+          try {
+            const list = await getCFContestList();
+            // Sort by start time descending to get the most recent
+            const sorted = list.sort((a, b) => b.startTimeSeconds - a.startTimeSeconds);
+            // Find the first contest that is either CODING or FINISHED (and not BEFORE)
+            // We prefer a running contest if any.
+            const running = sorted.find(c => c.phase === "CODING");
+            if (running) {
+              contest = running;
+              isLive = true;
+            } else {
+              // else pick the most recent finished contest
+              const finished = sorted.find(c => c.phase === "FINISHED");
+              if (finished) contest = finished;
+            }
+          } catch (e) {
+            console.error("Error fetching contest list:", e.message);
+          }
+
           if (!contest) {
             await reply(`⚠️ Could not detect the latest contest automatically (CF API may be down).\nPlease use \`// contest <id>\` to check standings manually.`);
             continue;
@@ -1247,16 +1266,31 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take a few seconds_`);
 
-          const { success, results, totalProblems, phase } = await getContestStandings(contest.id, handles);
-          const isLiveContest = phase === 'CODING';
+          // ── 2. Try standings API with retries ──
+          let standingsResult = null;
+          const maxRetries = 3;
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+              const result = await getContestStandings(contest.id, handles);
+              if (result.success) {
+                standingsResult = result;
+                break;
+              }
+              console.log(`Standings API attempt ${attempt} failed: ${result.error}`);
+            } catch (err) {
+              console.log(`Standings API attempt ${attempt} error:`, err.message);
+            }
+            if (attempt < maxRetries) await sleep(1000 * attempt); // exponential backoff
+          }
 
-          if (!success) {
-            // ✅ API genuinely failed – fallback to per‑member submission scan
+          if (!standingsResult || !standingsResult.success) {
+            // Fallback to slow method
             await handleSlowFallback(sock, chatId, contest.id, handles);
             continue;
           }
 
-          // ✅ API succeeded (even with 0 solves)
+          const { results, totalProblems, phase } = standingsResult;
+          const isLiveContest = phase === 'CODING';
           const participants = results.filter(r => r.solved > 0).sort(compareContestEntries);
 
           const [{ problems }] = await Promise.all([getContestDetails(contest.id)]);
