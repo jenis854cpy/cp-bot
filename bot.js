@@ -383,12 +383,15 @@ async function getCFContestList() {
 async function getContestInfo(contestId) {
   try {
     const response = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}`,
       { timeout: 10000 }
     );
     if (response.data.status === 'OK') {
       const contest = response.data.result.contest;
-      contest.problems = response.data.result.problems ? response.data.result.problems.length : 0;
+      const problems = response.data.result.problems || [];
+      contest.problems = problems.length;
+      contest.problemList = problems.map(p => p.index);
+      console.log(`📝 Contest ${contestId} has ${contest.problems} problems`);
       return contest;
     }
     return null;
@@ -642,6 +645,24 @@ function formatIST(unixSeconds) {
   }) + " IST";
 }
 
+// ─── NEW HELPER: getProblemLabels ────────────────────────────────────────────
+function getProblemLabels(count) {
+  if (!count || count < 1) return '';
+  const labels = [];
+  for (let i = 0; i < count; i++) {
+    let label = '';
+    let n = i;
+    let safety = 0;
+    while (n >= 0 && safety < 10) {
+      label = String.fromCharCode(65 + (n % 26)) + label;
+      n = Math.floor(n / 26) - 1;
+      safety++;
+    }
+    labels.push(label);
+  }
+  return labels.join(' ');
+}
+
 // ─── HYBRID STANDINGS SYSTEM ──────────────────────────────────────────────────
 
 // Cache
@@ -711,26 +732,34 @@ async function tier1DirectAPI(contestId, handles) {
   try {
     const handlesParam = handles.join(';');
     const url =
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&showUnofficial=true`;
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000&showUnofficial=true`;
     const response = await axios.get(url, { timeout: 15000 });
     const data = response.data;
+    
     if (data.status !== 'OK') {
       if (data.comment && data.comment.includes('handles: user not found')) {
         return { success: false, error: 'handles_not_found' };
       }
       return { success: false, error: data.comment || 'API error' };
     }
+    
     const result = data.result;
-    const rows = result.rows || [];
-    const contest = result.contest;
     const problems = result.problems || [];
     const totalProblems = problems.length;
+    const contest = result.contest;
     const phase = contest?.phase || 'FINISHED';
+    const rows = result.rows || [];
+    
+    console.log(`📝 Found ${totalProblems} problems via Tier 1`);
 
     const results = rows.map(row => {
       const members = row.party.members || [];
       const handle = members[0]?.handle || 'unknown';
-      const solved = row.problemResults ? row.problemResults.filter(pr => pr.points > 0).length : 0;
+      let solved = 0;
+      const problemResults = row.problemResults || [];
+      problemResults.forEach(pr => {
+        if (pr.points > 0) solved++;
+      });
       const rank = row.rank ?? null;
       const penalty = row.penalty ?? 0;
       return { handle, rank, solved, penalty, totalProblems };
@@ -738,9 +767,18 @@ async function tier1DirectAPI(contestId, handles) {
 
     const foundHandles = new Set(results.map(r => r.handle.toLowerCase()));
     const missing = handles.filter(h => !foundHandles.has(h.toLowerCase()));
+    
     if (missing.length) {
       console.log(`⚠️ Tier 1 missing ${missing.length} handles`);
-      return { success: false, error: 'handles_missing', partialResults: results, missing, totalProblems, phase, contest };
+      return { 
+        success: false, 
+        error: 'handles_missing', 
+        partialResults: results, 
+        missing, 
+        totalProblems, 
+        phase, 
+        contest 
+      };
     }
 
     return { success: true, results, totalProblems, phase, contest, source: 'direct' };
@@ -755,39 +793,51 @@ async function tier2FullStandings(contestId, handles) {
   console.log(`🚀 Tier 2: Full standings for contest ${contestId}`);
   try {
     const url =
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=100000&showUnofficial=true`;
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1000&showUnofficial=true`;
     const response = await axios.get(url, { timeout: 30000 });
     const data = response.data;
+    
     if (data.status !== 'OK') {
+      console.error(`⚠️ API Error: ${data.comment}`);
       return { success: false, error: data.comment || 'API error' };
     }
+    
     const result = data.result;
-    const rows = result.rows || [];
-    const contest = result.contest;
     const problems = result.problems || [];
     const totalProblems = problems.length;
+    const contest = result.contest;
     const phase = contest?.phase || 'FINISHED';
-
+    const rows = result.rows || [];
+    
+    console.log(`📝 Found ${totalProblems} problems`);
+    
     const map = {};
     rows.forEach(row => {
       const members = row.party.members || [];
       const handle = members[0]?.handle;
       if (!handle) return;
-      const solved = row.problemResults ? row.problemResults.filter(pr => pr.points > 0).length : 0;
+      
+      let solved = 0;
+      const problemResults = row.problemResults || [];
+      problemResults.forEach(pr => {
+        if (pr.points > 0) solved++;
+      });
+      
       const rank = row.rank ?? null;
       const penalty = row.penalty ?? 0;
       map[handle.toLowerCase()] = { handle, rank, solved, penalty, totalProblems };
     });
-
+    
     const results = handles.map(h => {
       const key = h.toLowerCase();
       return map[key] || { handle: h, rank: null, solved: 0, penalty: 0, totalProblems };
     });
-
+    
     console.log(`✅ Tier 2 found ${results.filter(r => r.solved > 0).length} participants`);
+    
     return { success: true, results, totalProblems, phase, contest, source: 'full' };
   } catch (e) {
-    console.warn(`⚠️ Tier 2 error: ${e.message}`);
+    console.error(`⚠️ Tier 2 error: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
@@ -807,31 +857,40 @@ async function tier3BatchProcessing(contestId, handles, batchSize = 20) {
     try {
       const handlesParam = chunk.join(';');
       const url =
-        `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&showUnofficial=true`;
+        `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000&showUnofficial=true`;
       const response = await axios.get(url, { timeout: 15000 });
       const data = response.data;
+      
       if (data.status !== 'OK') {
         console.warn(`   Batch failed: ${data.comment || 'unknown'}`);
         const totalProblemsValue = totalProblems || 0;
         chunk.forEach(h => allResults.push({ handle: h, rank: null, solved: 0, penalty: 0, totalProblems: totalProblemsValue }));
         continue;
       }
+      
       const result = data.result;
       const rows = result.rows || [];
       const problems = result.problems || [];
+      
       if (!totalProblems) {
         totalProblems = problems.length;
         phase = result.contest?.phase || 'FINISHED';
         contest = result.contest;
       }
+      
       const chunkResults = rows.map(row => {
         const members = row.party.members || [];
         const handle = members[0]?.handle || 'unknown';
-        const solved = row.problemResults ? row.problemResults.filter(pr => pr.points > 0).length : 0;
+        let solved = 0;
+        const problemResults = row.problemResults || [];
+        problemResults.forEach(pr => {
+          if (pr.points > 0) solved++;
+        });
         const rank = row.rank ?? null;
         const penalty = row.penalty ?? 0;
         return { handle, rank, solved, penalty, totalProblems };
       });
+      
       const found = new Set(chunkResults.map(r => r.handle.toLowerCase()));
       const totalProblemsValue = totalProblems || 0;
       chunk.forEach(h => {
@@ -848,6 +907,7 @@ async function tier3BatchProcessing(contestId, handles, batchSize = 20) {
     if (i + batchSize < handles.length) await sleep(500);
   }
 
+  // Remove duplicates
   const seen = new Set();
   const unique = [];
   for (const r of allResults) {
@@ -874,9 +934,10 @@ async function tier4IndividualRequests(contestId, handles) {
     const handle = handles[i];
     try {
       const url =
-        `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handle}&showUnofficial=true`;
+        `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handle}&from=1&count=1&showUnofficial=true`;
       const response = await axios.get(url, { timeout: 10000 });
       const data = response.data;
+      
       if (data.status === 'OK') {
         const result = data.result;
         const rows = result.rows || [];
@@ -888,7 +949,11 @@ async function tier4IndividualRequests(contestId, handles) {
         }
         if (rows.length) {
           const row = rows[0];
-          const solved = row.problemResults ? row.problemResults.filter(pr => pr.points > 0).length : 0;
+          let solved = 0;
+          const problemResults = row.problemResults || [];
+          problemResults.forEach(pr => {
+            if (pr.points > 0) solved++;
+          });
           const rank = row.rank ?? null;
           const penalty = row.penalty ?? 0;
           results.push({ handle, rank, solved, penalty, totalProblems });
@@ -914,6 +979,7 @@ async function tier5SubmissionScan(contestId, handles, contestInfo) {
   console.log(`🐢 Tier 5: Submission scan (${handles.length} handles)`);
   const results = [];
   const meta = contestInfo || await getContestInfo(contestId);
+  
   if (!meta) {
     return {
       success: false,
@@ -993,6 +1059,7 @@ async function getContestStandings(contestId, handles) {
     }
     validHandles = valid;
   }
+  
   if (!validHandles.length) {
     return {
       success: false,
@@ -1007,14 +1074,24 @@ async function getContestStandings(contestId, handles) {
 
   let result;
   const useDirect = validHandles.length <= 30;
+  
   if (useDirect) {
+    console.log('📌 Using Tier 1 (Direct API)');
     result = await tier1DirectAPI(contestId, validHandles);
+    
     if (result.success) {
+      console.log('✅ Tier 1 succeeded');
       const found = new Set(result.results.map(r => r.handle.toLowerCase()));
       const missing = validHandles.filter(h => !found.has(h.toLowerCase()));
       if (missing.length) {
         console.log(`ℹ️ Adding ${missing.length} missing handles as 0 solves`);
-        const zeroResults = missing.map(h => ({ handle: h, rank: null, solved: 0, penalty: 0, totalProblems: result.totalProblems }));
+        const zeroResults = missing.map(h => ({ 
+          handle: h, 
+          rank: null, 
+          solved: 0, 
+          penalty: 0, 
+          totalProblems: result.totalProblems 
+        }));
         result.results.push(...zeroResults);
       }
       result.results.sort(compareContestEntries);
@@ -1022,64 +1099,53 @@ async function getContestStandings(contestId, handles) {
       return result;
     } else if (result.error === 'handles_missing') {
       console.log(`🔄 Tier 1 partial, fetching missing ${result.missing.length} handles`);
-      const fullResult = await tier2FullStandings(contestId, validHandles);
-      if (fullResult.success) {
-        const partialMap = new Map(result.partialResults.map(r => [r.handle.toLowerCase(), r]));
-        const fullMap = new Map(fullResult.results.map(r => [r.handle.toLowerCase(), r]));
-        const merged = validHandles.map(h => {
-          const key = h.toLowerCase();
-          if (partialMap.has(key)) return partialMap.get(key);
-          if (fullMap.has(key)) return fullMap.get(key);
-          return { handle: h, rank: null, solved: 0, penalty: 0, totalProblems: fullResult.totalProblems || 0 };
-        });
-        merged.sort(compareContestEntries);
-        const finalResult = {
-          success: true,
-          results: merged,
-          totalProblems: fullResult.totalProblems || result.totalProblems,
-          phase: fullResult.phase || result.phase,
-          contest: fullResult.contest || result.contest,
-          source: 'direct+full'
-        };
-        setCache(cacheKey, finalResult, finalResult.phase);
-        return finalResult;
-      }
+    } else {
+      console.log(`⚠️ Tier 1 failed: ${result.error}`);
     }
   }
 
-  console.log('🔄 Falling back to Tier 2: Full standings');
+  console.log('📌 Using Tier 2 (Full standings)');
   result = await tier2FullStandings(contestId, validHandles);
+  
   if (result.success) {
+    console.log('✅ Tier 2 succeeded');
     result.results.sort(compareContestEntries);
     setCache(cacheKey, result, result.phase);
     return result;
   }
+  console.log(`⚠️ Tier 2 failed: ${result.error}`);
 
-  console.log('🔄 Falling back to Tier 3: Batch processing');
+  console.log('📌 Using Tier 3 (Batch processing)');
   result = await tier3BatchProcessing(contestId, validHandles, 20);
   if (result.success) {
+    console.log('✅ Tier 3 succeeded');
     result.results.sort(compareContestEntries);
     setCache(cacheKey, result, result.phase);
     return result;
   }
+  console.log(`⚠️ Tier 3 failed: ${result.error}`);
 
-  console.log('🔄 Falling back to Tier 4: Individual requests');
+  console.log('📌 Using Tier 4 (Individual requests)');
   result = await tier4IndividualRequests(contestId, validHandles);
   if (result.success) {
+    console.log('✅ Tier 4 succeeded');
     result.results.sort(compareContestEntries);
     setCache(cacheKey, result, result.phase);
     return result;
   }
+  console.log(`⚠️ Tier 4 failed: ${result.error}`);
 
-  console.log('🔄 Falling back to Tier 5: Submission scan');
+  console.log('📌 Using Tier 5 (Submission scan)');
   const contestInfo = await getContestInfo(contestId);
   result = await tier5SubmissionScan(contestId, validHandles, contestInfo);
   if (result.success) {
+    console.log('✅ Tier 5 succeeded');
     result.results.sort(compareContestEntries);
     setCache(cacheKey, result, result.phase);
     return result;
   }
 
+  console.log('❌ All tiers failed');
   return {
     success: false,
     error: 'All tiers failed',
@@ -1103,15 +1169,33 @@ function compareContestEntries(a, b) {
 
 // ─── FORMAT FUNCTION ──────────────────────────────────────────────────────────
 function formatContestStandings(results, totalProblems, isLive, contestInfo) {
+  // Fallback if totalProblems is 0
+  if (totalProblems === 0) {
+    console.log('⚠️ totalProblems is 0, trying to get from contestInfo');
+    if (contestInfo && contestInfo.problems) {
+      totalProblems = contestInfo.problems;
+    }
+  }
+  
   let text = '';
   if (isLive) {
-    text += `🟢 *LIVE* ${contestInfo.name}\n`;
+    text += `🟢 *LIVE* ${contestInfo?.name || `Contest #${contestInfo?.id}`}\n`;
   } else {
-    text += `🏁 *${contestInfo.name}*\n`;
+    text += `🏁 *${contestInfo?.name || `Contest #${contestInfo?.id}`}*\n`;
   }
-  text += `📅 ${formatIST(contestInfo.startTimeSeconds)}\n`;
-  text += `⏱ Duration: ${formatDuration(contestInfo.durationSeconds)}\n`;
-  text += `📝 Problems: ${totalProblems}\n`;
+  
+  if (contestInfo?.startTimeSeconds) {
+    text += `📅 ${formatIST(contestInfo.startTimeSeconds)}\n`;
+  }
+  if (contestInfo?.durationSeconds) {
+    text += `⏱ Duration: ${formatDuration(contestInfo.durationSeconds)}\n`;
+  }
+  text += `📝 Problems: ${totalProblems || 0}\n`;
+  
+  if (totalProblems > 0) {
+    const labels = getProblemLabels(totalProblems);
+    text += `📋 ${labels}\n`;
+  }
   text += `${"─".repeat(28)}\n\n`;
 
   const active = results.filter(r => r.solved > 0).sort(compareContestEntries);
@@ -1129,7 +1213,7 @@ function formatContestStandings(results, totalProblems, isLive, contestInfo) {
     text += '\n';
   }
 
-  if (zero.length) {
+  if (zero.length > 0) {
     text += `💤 ${zero.length} member${zero.length > 1 ? 's' : ''} with 0 solves.\n`;
     if (zero.length <= 10) {
       zero.forEach(r => {
