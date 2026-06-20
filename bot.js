@@ -15,6 +15,17 @@ const pino = require("pino");
 
 let latestQR = null;
 
+// ─── Process-level safety net ──────────────────────────────────────────────────
+// Without these, a single stray error anywhere (a bad API response, a Mongo
+// blip, etc.) can crash the whole Node process. Since the reminder cron lives
+// in this same process, a crash = missed reminders until something restarts it.
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught Exception:", err);
+});
+
 // ─── MongoDB ───────────────────────────────────────────────────────────────────
 mongoose
   .connect(process.env.MONGODB_URI)
@@ -539,47 +550,79 @@ async function checkAndSendReminders(sock) {
       const chatId = group.chatId;
       if (!chatId.endsWith("@g.us")) continue;
 
-      const groupData = await getGroupData(chatId);
-      const handles = getAllHandles(groupData);
-      if (!handles.length) {
-        console.log(`⏭️ Skipping ${chatId} – no members.`);
-        continue;
-      }
+      try {
+        const groupData = await getGroupData(chatId);
+        const handles = getAllHandles(groupData);
+        if (!handles.length) {
+          console.log(`⏭️ Skipping ${chatId} – no members.`);
+          continue;
+        }
 
-      const reminders = groupData.reminders || {};
+        const reminders = groupData.reminders || {};
+        let changed = false;
 
-      for (const contest of allContests) {
-        const diff = contest.startTimeSeconds - now;
-        const minsLeft = Math.round(diff / 60);
-        const hoursLeft = Math.round(diff / 3600);
-        
-        console.log(`⏰ ${contest.platform} - ${contest.name}: ${hoursLeft}h ${minsLeft % 60}m left`);
+        for (const contest of allContests) {
+          const diff = contest.startTimeSeconds - now;
+          const minsLeft = Math.round(diff / 60);
+          const hoursLeft = Math.round(diff / 3600);
 
-        if (diff >= 22 * 3600 && diff <= 26 * 3600) {
-          if (!reminders[contest.id]?.daySent) {
-            await sendReminder(sock, chatId, contest, "day");
-            if (!reminders[contest.id]) reminders[contest.id] = {};
-            reminders[contest.id].daySent = true;
-            console.log(`✅ Day reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
-          } else {
-            console.log(`⏭️ Day reminder already sent for ${contest.id}`);
+          console.log(`⏰ ${contest.platform} - ${contest.name}: ${hoursLeft}h ${minsLeft % 60}m left`);
+
+          // Day-before reminder. Window widened to (1h, 24h] — previously this
+          // was a narrow 22-26h slot, so any downtime/slow API call during
+          // that exact 4h window meant the reminder was lost forever. Now,
+          // as long as the bot is up *at any point* in that 23h span, it'll
+          // catch up on the next 10-min check.
+          if (diff > 1 * 3600 && diff <= 24 * 3600 && !reminders[contest.id]?.daySent) {
+            const ok = await sendReminder(sock, chatId, contest, "day");
+            if (ok) {
+              if (!reminders[contest.id]) reminders[contest.id] = { startTimeSeconds: contest.startTimeSeconds };
+              reminders[contest.id].daySent = true;
+              changed = true;
+              console.log(`✅ Day reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
+            } else {
+              console.log(`⚠️ Day reminder FAILED to send for ${contest.id} — will retry next cycle`);
+            }
+          }
+
+          // Hour-before reminder. Window widened to (0, 60min] for the same
+          // catch-up reason. Crucially: the flag is ONLY set when sendReminder
+          // actually confirms delivery — a failed sock.sendMessage() no longer
+          // gets silently recorded as "sent".
+          if (diff > 0 && diff <= 60 * 60 && !reminders[contest.id]?.hourSent) {
+            const ok = await sendReminder(sock, chatId, contest, "hour");
+            if (ok) {
+              if (!reminders[contest.id]) reminders[contest.id] = { startTimeSeconds: contest.startTimeSeconds };
+              reminders[contest.id].hourSent = true;
+              changed = true;
+              console.log(`✅ Hour reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
+            } else {
+              console.log(`⚠️ Hour reminder FAILED to send for ${contest.id} — will retry next cycle`);
+            }
           }
         }
-        
-        if (diff >= 30 * 60 && diff <= 120 * 60) {
-          if (!reminders[contest.id]?.hourSent) {
-            await sendReminder(sock, chatId, contest, "hour");
-            if (!reminders[contest.id]) reminders[contest.id] = {};
-            reminders[contest.id].hourSent = true;
-            console.log(`✅ Hour reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
-          } else {
-            console.log(`⏭️ Hour reminder already sent for ${contest.id}`);
+
+        // Garbage-collect flags for contests that started 2+ days ago so the
+        // `reminders` object doesn't grow forever. Based on stored timestamp,
+        // not on whether the contest is still in this cycle's fetch result —
+        // a single platform's API hiccup (returns []) must never cause us to
+        // wipe and resend reminders for contests that are still upcoming.
+        for (const [id, r] of Object.entries(reminders)) {
+          if (r?.startTimeSeconds && now - r.startTimeSeconds > 2 * 86400) {
+            delete reminders[id];
+            changed = true;
           }
         }
-      }
 
-      groupData.reminders = reminders;
-      await saveGroupData(chatId, groupData);
+        if (changed) {
+          groupData.reminders = reminders;
+          await saveGroupData(chatId, groupData);
+        }
+      } catch (groupErr) {
+        // Isolated per group: one bad group/DB hiccup must not abort the
+        // entire cycle and skip every other group's reminders too.
+        console.error(`❌ Reminder error for group ${chatId}:`, groupErr.message);
+      }
     }
     
     console.log(`✅ Reminder check completed at ${new Date().toISOString()}`);
@@ -619,8 +662,10 @@ async function sendReminder(sock, chatId, contest, type) {
   try {
     await sock.sendMessage(chatId, { text: message });
     console.log(`✅ Reminder sent for ${contest.id} (${type}) to ${chatId}`);
+    return true;
   } catch (e) {
     console.error(`Failed to send reminder to ${chatId}:`, e.message);
+    return false;
   }
 }
 
@@ -1232,6 +1277,20 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Express server on port ${PORT}`));
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
+// `activeSock` always points at the CURRENT live connection. Cron jobs read
+// from this instead of closing over a specific `sock` instance, so a
+// reconnect can never leave a duplicate, dead-socket interval running.
+let activeSock = null;
+let cronJobsStarted = false;
+
+function startCronJobs() {
+  if (cronJobsStarted) return; // guarantees these intervals are created exactly once for the process lifetime
+  cronJobsStarted = true;
+  console.log("✅ Cron jobs started (single instance — survives reconnects)");
+  setInterval(() => { if (activeSock) checkAndSendReminders(activeSock); }, 10 * 60 * 1000);
+  setInterval(() => { if (activeSock) checkAndAnnounceWinner(activeSock); }, 5 * 60 * 1000);
+}
+
 async function startBot() {
   const { state, saveCreds } = await useMongoAuthState();
   const { version } = await fetchLatestBaileysVersion();
@@ -1247,27 +1306,27 @@ async function startBot() {
       console.log("📱 QR ready! Visit /qr on your Render URL.");
     }
     if (connection === "close") {
+      if (activeSock === sock) activeSock = null; // this socket is dead, stop routing cron jobs to it
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) setTimeout(startBot, 3000);
       else console.log("Logged out. Clear AuthState from MongoDB.");
     }
     if (connection === "open") {
       latestQR = null;
+      activeSock = sock;
       console.log("✅ CF Bot is ready!");
 
       console.log("🚀 Running immediate reminder check...");
-      await checkAndSendReminders(sock);
+      checkAndSendReminders(sock);
 
       setTimeout(() => {
+        if (activeSock !== sock) return; // a newer connection has since taken over
         console.log("🔄 Running startup reminder check (delayed)...");
         checkAndSendReminders(sock);
       }, 30000);
 
-      console.log("✅ Reminder interval started");
-      setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
-
-      setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
-      setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
+      startCronJobs();
+      setTimeout(() => { if (activeSock) checkAndAnnounceWinner(activeSock); }, 2 * 60 * 1000);
     }
   });
 
