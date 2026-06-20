@@ -487,16 +487,27 @@ async function getLeetCodeUpcoming() {
 // ─── Reminder System ──────────────────────────────────────────────────────────
 async function checkAndSendReminders(sock) {
   try {
-    const [cf, cc, lc, at] = await Promise.all([
+    console.log(`🔄 Running reminder check at ${new Date().toISOString()}`);
+    
+    // Use Promise.allSettled so one API failure doesn't break everything
+    const results = await Promise.allSettled([
       getCFUpcoming(),
       getCodeChefUpcoming(),
       getLeetCodeUpcoming(),
       getAtCoderUpcoming(),
     ]);
-    const allContests = [...cf, ...cc, ...lc, ...at];
-    if (!allContests.length) return;
 
-    console.log(`🔍 Checking ${allContests.length} upcoming contests...`);
+    // Extract successful results only
+    const allContests = results
+      .filter(result => result.status === 'fulfilled')
+      .flatMap(result => result.value);
+
+    if (!allContests.length) {
+      console.log("⚠️ No upcoming contests found.");
+      return;
+    }
+
+    console.log(`🔍 Found ${allContests.length} upcoming contests`);
 
     const now = Math.floor(Date.now() / 1000);
     const groups = await CFData.find({}).lean();
@@ -507,29 +518,43 @@ async function checkAndSendReminders(sock) {
 
       const groupData = await getGroupData(chatId);
       const handles = getAllHandles(groupData);
-      if (!handles.length) continue;
+      
+      // Skip groups with no members
+      if (!handles.length) {
+        console.log(`⏭️ Skipping ${chatId} – no members.`);
+        continue;
+      }
 
       const reminders = groupData.reminders || {};
 
       for (const contest of allContests) {
         const diff = contest.startTimeSeconds - now;
         const minsLeft = Math.round(diff / 60);
-        console.log(`⏰ ${contest.platform} - ${contest.name}: ${minsLeft} min left`);
+        const hoursLeft = Math.round(diff / 3600);
+        
+        console.log(`⏰ ${contest.platform} - ${contest.name}: ${hoursLeft}h ${minsLeft % 60}m left`);
 
-        // 1-day reminder: 23.5–24.5 hours
-        if (diff >= 23.5 * 3600 && diff <= 24.5 * 3600) {
+        // DAY REMINDER: 22–26 hours (was 23.5–24.5)
+        if (diff >= 22 * 3600 && diff <= 26 * 3600) {
           if (!reminders[contest.id]?.daySent) {
             await sendReminder(sock, chatId, contest, "day");
             if (!reminders[contest.id]) reminders[contest.id] = {};
             reminders[contest.id].daySent = true;
+            console.log(`✅ Day reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
+          } else {
+            console.log(`⏭️ Day reminder already sent for ${contest.id}`);
           }
         }
-        // 1-hour reminder: 30–90 minutes
-        if (diff >= 30 * 60 && diff <= 90 * 60) {
+        
+        // HOUR REMINDER: 30–120 minutes (was 30–90)
+        if (diff >= 30 * 60 && diff <= 120 * 60) {
           if (!reminders[contest.id]?.hourSent) {
             await sendReminder(sock, chatId, contest, "hour");
             if (!reminders[contest.id]) reminders[contest.id] = {};
             reminders[contest.id].hourSent = true;
+            console.log(`✅ Hour reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
+          } else {
+            console.log(`⏭️ Hour reminder already sent for ${contest.id}`);
           }
         }
       }
@@ -537,8 +562,12 @@ async function checkAndSendReminders(sock) {
       groupData.reminders = reminders;
       await saveGroupData(chatId, groupData);
     }
-  } catch (e) {
-    console.error("checkAndSendReminders error:", e.message);
+    
+    console.log(`✅ Reminder check completed at ${new Date().toISOString()}`);
+    
+  } catch (error) {
+    console.error("❌ checkAndSendReminders error:", error.message);
+    // Don't throw - let the cron job continue
   }
 }
 
@@ -1077,7 +1106,7 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       latestQR = qr;
@@ -1093,12 +1122,22 @@ async function startBot() {
       latestQR = null;
       console.log("✅ CF Bot is ready!");
 
+      // ─── Immediate reminder check ───────────────────────────────────────
+      console.log("🚀 Running immediate reminder check...");
+      await checkAndSendReminders(sock);
+
+      // ─── Delayed reminder check (ensures everything is fully loaded) ──
+      setTimeout(() => {
+        console.log("🔄 Running startup reminder check (delayed)...");
+        checkAndSendReminders(sock);
+      }, 30000);
+
+      // ─── Periodic checks ────────────────────────────────────────────────
       console.log("✅ Reminder interval started");
       setInterval(() => checkAndSendReminders(sock), 10 * 60 * 1000);
 
       setInterval(() => checkAndAnnounceWinner(sock), 5 * 60 * 1000);
       setTimeout(() => checkAndAnnounceWinner(sock), 2 * 60 * 1000);
-      setTimeout(() => checkAndSendReminders(sock), 30 * 1000);
     }
   });
 
