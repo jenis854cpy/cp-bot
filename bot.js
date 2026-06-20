@@ -1107,45 +1107,20 @@ async function checkAndAnnounceWinner(sock) {
         continue;
       }
 
-      let ratingChanges = [];
-      try {
-        const res = await axios.get(
-          `https://codeforces.com/api/contest.ratingChanges?contestId=${lastId}`,
-          { timeout: 15000 }
-        );
-        if (res.data && res.data.status === 'OK' && res.data.result) {
-          ratingChanges = res.data.result;
-        }
-      } catch (e) {
-        console.log(`No rating changes for contest ${lastId}`);
-      }
+      const { ready, promoted } = await getContestPromotions(lastId, handles);
 
-      if (!ratingChanges.length) {
+      if (!ready) {
+        // Big Div2/3/4 rounds can take well over 30 min for CF to finish
+        // computing ratings, so keep retrying for up to 3 hours. After that,
+        // assume it's a genuinely unrated contest and stop checking it
+        // (otherwise this would retry every 5 min forever).
+        if (now - endTime < 3 * 3600) {
+          console.log(`⏳ Ratings not published yet for contest ${lastId}, will retry`);
+          continue;
+        }
+        console.log(`ℹ️ No rating changes 3h+ after contest ${lastId} — assuming unrated, won't retry further`);
         await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
         continue;
-      }
-
-      const changeMap = {};
-      for (const entry of ratingChanges) {
-        changeMap[entry.handle.toLowerCase()] = entry;
-      }
-
-      const promoted = [];
-      for (const handle of handles) {
-        const entry = changeMap[handle.toLowerCase()];
-        if (!entry) continue;
-        const oldRank = entry.oldRating === 0 ? "Unrated" : getRankFromRating(entry.oldRating);
-        const newRank = getRankFromRating(entry.newRating);
-        if (getRankIndex(newRank) > getRankIndex(oldRank)) {
-          promoted.push({
-            handle,
-            oldRank,
-            newRank,
-            oldRating: entry.oldRating,
-            newRating: entry.newRating,
-            delta: entry.newRating - entry.oldRating,
-          });
-        }
       }
 
       if (promoted.length) {
@@ -1182,6 +1157,50 @@ async function getRecentFinishedContest() {
     const finished = list.filter((c) => c.phase === "FINISHED");
     return finished.length ? finished[0] : null;
   } catch { return null; }
+}
+
+// ─── Promotions (rank-up) Helper ──────────────────────────────────────────────
+// Shared by the automatic post-contest announcer AND the `// solved` command,
+// so both report rank-ups the same way instead of duplicating the logic.
+// Returns:
+//   { ready: true,  promoted: [...] }   if CF has published rating changes
+//   { ready: false, promoted: [] }      if CF hasn't processed ratings yet
+async function getContestPromotions(contestId, handles) {
+  try {
+    const res = await axios.get(
+      `https://codeforces.com/api/contest.ratingChanges?contestId=${contestId}`,
+      { timeout: 15000 }
+    );
+    const changes = (res.data?.status === "OK" && res.data.result) ? res.data.result : [];
+    if (!changes.length) return { ready: false, promoted: [] };
+
+    const changeMap = {};
+    for (const entry of changes) changeMap[entry.handle.toLowerCase()] = entry;
+
+    const promoted = [];
+    for (const handle of handles) {
+      const entry = changeMap[handle.toLowerCase()];
+      if (!entry) continue;
+      const oldRank = entry.oldRating === 0 ? "Unrated" : getRankFromRating(entry.oldRating);
+      const newRank = getRankFromRating(entry.newRating);
+      if (getRankIndex(newRank) > getRankIndex(oldRank)) {
+        promoted.push({
+          handle,
+          oldRank,
+          newRank,
+          oldRating: entry.oldRating,
+          newRating: entry.newRating,
+          delta: entry.newRating - entry.oldRating,
+        });
+      }
+    }
+    return { ready: true, promoted };
+  } catch (e) {
+    // Codeforces returns an error (not just empty data) for a contest whose
+    // ratings haven't been processed yet — treat that the same as "not ready".
+    console.log(`Rating changes not available yet for contest ${contestId}: ${e.message}`);
+    return { ready: false, promoted: [] };
+  }
 }
 
 // ─── Delta7 ──────────────────────────────────────────────────────────────────
@@ -1500,8 +1519,24 @@ async function startBot() {
 
           const isLiveContest = result.phase === 'CODING';
           const output = formatContestStandings(result.results, result.totalProblems, isLiveContest, contest);
+
+          let promoText = "";
+          if (!isLiveContest) {
+            // Contest is over — check if any of our members ranked up
+            // (e.g. Pupil → Specialist) because of this contest.
+            const { ready, promoted } = await getContestPromotions(contest.id, handles);
+            if (ready && promoted.length) {
+              promoText += `\n\n🎉 *Rank-Ups!*\n${"─".repeat(28)}\n`;
+              for (const p of promoted) {
+                promoText += `${rankEmoji(p.newRank)} *${p.handle}*: ${p.oldRank} → *${p.newRank}* (${p.oldRating}→${p.newRating}, ${p.delta >= 0 ? '+' : ''}${p.delta}) 🚀\n`;
+              }
+            } else if (!ready) {
+              promoText += `\n\n⏳ _Ratings not finalized by Codeforces yet — rank-ups, if any, will show once they're published._`;
+            }
+          }
+
           // Append contest link
-          await reply(output + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
+          await reply(output + promoText + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
         }
 
         // ── // contest ──────────────────────────────────────────────────
