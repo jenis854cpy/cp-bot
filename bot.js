@@ -109,6 +109,46 @@ function getAllHandles(groupData) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ─── Codeforces Rate Limiter + 429 Auto-Retry (global, all axios calls) ──────
+// CF enforces an informal request-rate limit per IP. Bursts of calls (handle
+// validation + Tier 1 + Tier 2 + background winner/reminder checks all hitting
+// CF around the same time) can trigger 429s. Tier 1 previously had ZERO retry
+// logic, so a single 429 there silently pushed every // solved and // contest
+// call down to Tier 3 (submission scan), which is why rank showed N/A and the
+// result changed every time. This wraps the shared axios instance once, so
+// every codeforces.com request — anywhere in this file — gets spaced out and
+// auto-retried on 429, with no need to touch each call site individually.
+let lastCFRequestAt = 0;
+const CF_MIN_GAP_MS = 350;
+
+axios.interceptors.request.use(async (config) => {
+  if (config.url && config.url.includes("codeforces.com")) {
+    const wait = lastCFRequestAt + CF_MIN_GAP_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCFRequestAt = Date.now();
+  }
+  return config;
+});
+
+axios.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    const config = error.config;
+    const isCF = config?.url?.includes("codeforces.com");
+    const is429 = error.response?.status === 429;
+    if (isCF && is429) {
+      config.__cfRetryCount = (config.__cfRetryCount || 0) + 1;
+      if (config.__cfRetryCount <= 3) {
+        const delay = [2000, 4000, 8000][config.__cfRetryCount - 1];
+        console.log(`⏳ CF 429 rate-limited — retry ${config.__cfRetryCount}/3 in ${delay / 1000}s: ${config.url}`);
+        await sleep(delay);
+        return axios(config);
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 // ─── Rank order for promotion detection ──────────────────────────────────────
 const RANK_ORDER = [
   "Unrated", "Newbie", "Pupil", "Specialist",
