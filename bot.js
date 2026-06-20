@@ -634,213 +634,332 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-// ─── Shared helper to build results from standings rows ─────────────────────
-function buildResultsFromRows(rows, problems, phase, handles) {
-  const problemCount = problems.length;
-  const results = handles.map(handle => {
-    const row = rows.find(r =>
-      r.party.members.some(m => m.handle.toLowerCase() === handle.toLowerCase())
-    );
-    if (!row) {
-      return { handle, rank: null, solved: 0, penalty: 0, totalProblems: problemCount, problemResults: [] };
-    }
-    let solved = 0;
-    const problemResults = [];
-    (row.problemResults || []).forEach((pr, idx) => {
-      const isSolved = pr.points > 0;
-      if (isSolved) solved++;
-      problemResults.push({
-        index: problems[idx]?.index || String.fromCharCode(65 + idx),
-        solved: isSolved,
-        attempts: pr.rejectedAttempts || 0
+// =============================================================================
+// NEW STANDINGS FUNCTIONS (3‑TIER WITH VALIDATION & RETRIES)
+// =============================================================================
+
+// ─── Helper: Build results from API rows ─────────────────────────────────────
+function buildResultsFromRows(data) {
+  const results = [];
+  const problemCount = data.problems ? data.problems.length : 0;
+  const phase = data.contest ? data.contest.phase : 'FINISHED';
+
+  if (data.rows) {
+    data.rows.forEach(row => {
+      let solved = 0;
+      const problemResults = [];
+
+      if (row.problemResults && data.problems) {
+        row.problemResults.forEach((pr, index) => {
+          const isSolved = pr.points > 0;
+          if (isSolved) solved++;
+          problemResults.push({
+            index: data.problems[index]?.index || String.fromCharCode(65 + index),
+            solved: isSolved,
+            attempts: pr.rejectedAttempts || 0
+          });
+        });
+      }
+
+      const members = row.party.members || [];
+      const handle = members[0]?.handle || 'unknown';
+
+      results.push({
+        handle,
+        rank: phase === 'CODING' ? null : (row.rank || null),
+        solved,
+        penalty: row.penalty || 0,
+        totalProblems: problemCount,
+        problemResults
       });
     });
-    return {
-      handle,
-      rank: (phase === 'CODING' || phase === 'BEFORE') ? null : (row.rank || null),
-      solved,
-      penalty: row.penalty || 0,
-      totalProblems: problemCount,
-      problemResults
-    };
-  });
-  return { results, totalProblems: problemCount };
-}
-
-// ─── getContestInfo (fallback info) ──────────────────────────────────────────
-async function getContestInfo(contestId) {
-  try {
-    const response = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
-      { timeout: 8000 }
-    );
-    const data = response.data;
-    if (data && data.status === 'OK' && data.result && data.result.contest) {
-      return data.result.contest;
-    }
-    return { 
-      name: `Codeforces Round #${contestId}`, 
-      startTimeSeconds: 0, 
-      durationSeconds: 7200,
-      phase: 'FINISHED'
-    };
-  } catch {
-    return { 
-      name: `Codeforces Round #${contestId}`, 
-      startTimeSeconds: 0, 
-      durationSeconds: 7200,
-      phase: 'FINISHED'
-    };
   }
+
+  return { results, totalProblems: problemCount, phase, contest: data.contest };
 }
 
-// ─── getContestStandings (3‑tier) ────────────────────────────────────────────
-async function getContestStandings(contestId, handles) {
-  // Tier 1: with handles
+// ─── Validate handles ────────────────────────────────────────────────────────
+async function validateHandles(handles) {
+  console.log(`🔍 Validating ${handles.length} handles...`);
+  const valid = [];
+  const invalid = [];
+
+  for (const handle of handles) {
+    try {
+      const response = await axios.get(
+        `https://codeforces.com/api/user.info?handles=${handle}`,
+        { timeout: 5000 }
+      );
+      if (response.data && response.data.status === 'OK') {
+        valid.push(handle);
+        console.log(`✅ Valid handle: ${handle}`);
+      } else {
+        invalid.push(handle);
+        console.log(`❌ Invalid handle: ${handle}`);
+      }
+    } catch (error) {
+      invalid.push(handle);
+      console.log(`❌ Failed to validate: ${handle} (${error.message})`);
+    }
+    await sleep(200);
+  }
+
+  if (invalid.length > 0) {
+    console.log(`⚠️ Invalid handles (skipped): ${invalid.join(', ')}`);
+  }
+  console.log(`✅ ${valid.length} valid handles found`);
+  return valid;
+}
+
+// ─── Tier 1: Fast path with handles ─────────────────────────────────────────
+async function tier1Fetch(contestId, handles, timeout = 15000) {
+  console.log('🚀 Tier 1: Fetching with handles...');
   try {
     const handlesParam = handles.join(';');
     const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000`;
-    const response = await axios.get(url, { timeout: 10000 });
+    const response = await axios.get(url, { timeout });
     const data = response.data;
-    if (data.status === 'OK' && data.result) {
-      const phase = data.result.contest?.phase || 'FINISHED';
-      const { results, totalProblems } = buildResultsFromRows(
-        data.result.rows || [],
-        data.result.problems || [],
-        phase,
-        handles
-      );
-      return {
-        success: true,
-        data: { results, totalProblems, phase, contest: data.result.contest, problems: data.result.problems || [] },
-        source: 'handles'
-      };
-    }
-    console.log(`Tier1 failed: ${data.comment || 'no comment'}`);
-  } catch (err) {
-    console.log(`Tier1 error: ${err.message}`);
-  }
 
-  // Tier 2: full standings, filtered client‑side
-  try {
-    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=10000`;
-    const response = await axios.get(url, { timeout: 20000 });
-    const data = response.data;
-    if (data.status === 'OK' && data.result) {
-      const phase = data.result.contest?.phase || 'FINISHED';
-      const { results, totalProblems } = buildResultsFromRows(
-        data.result.rows || [],
-        data.result.problems || [],
-        phase,
-        handles
-      );
-      return {
-        success: true,
-        data: { results, totalProblems, phase, contest: data.result.contest, problems: data.result.problems || [] },
-        source: 'full'
-      };
+    if (data.status === 'OK') {
+      console.log('✅ Tier 1 succeeded');
+      const result = buildResultsFromRows(data.result);
+      return { success: true, ...result };
+    } else {
+      if (data.comment && data.comment.includes('handles: user not found')) {
+        console.log('⚠️ Tier 1: Some handles not found in contest');
+        return { success: false, error: 'handles_not_found', comment: data.comment };
+      } else {
+        console.log(`⚠️ Tier 1 failed: ${data.comment}`);
+        return { success: false, error: data.comment || 'API error' };
+      }
     }
-    console.log(`Tier2 failed: ${data.comment || 'no comment'}`);
-  } catch (err) {
-    console.log(`Tier2 error: ${err.message}`);
+  } catch (error) {
+    console.log(`⚠️ Tier 1 error: ${error.message}`);
+    return { success: false, error: error.message };
   }
-
-  return { success: false, error: 'All API tiers failed' };
 }
 
-// ─── Slow fallback (per‑user submission scan) ───────────────────────────────
-async function handleSlowFallback(sock, from, contestId, handles, contestInfo = null) {
-  try {
-    await sock.sendMessage(from, { text: '⏳ Using slow fallback method... This may take a moment.' });
+// ─── Tier 2: Full standings with retries ────────────────────────────────────
+async function tier2Fetch(contestId, handles, maxRetries = 3) {
+  console.log('🚀 Tier 2: Fetching full standings...');
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1000`;
+      const response = await axios.get(url, { timeout: 30000 });
+      const data = response.data;
 
-    if (!contestInfo || !contestInfo.startTimeSeconds) {
-      contestInfo = await getContestInfo(contestId);
-    }
-    if (!contestInfo || !contestInfo.startTimeSeconds) {
-      await sock.sendMessage(from, { text: `❌ Could not determine timing for contest #${contestId}.` });
-      return;
-    }
-
-    const startTime = contestInfo.startTimeSeconds || 0;
-    const duration = contestInfo.durationSeconds || 7200;
-    const endTime = startTime + duration;
-    const now = Math.floor(Date.now() / 1000);
-    const upperBound = (contestInfo.phase === 'CODING') ? now : endTime;
-
-    let totalProblems = 0;
-    const results = [];
-
-    for (let i = 0; i < handles.length; i++) {
-      const handle = handles[i];
-      if (i > 0) await sleep(400);
-
-      try {
-        const subRes = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-          { timeout: 15000 }
+      if (data.status === 'OK') {
+        console.log('✅ Tier 2 succeeded');
+        const result = buildResultsFromRows(data.result);
+        // Filter only our handles
+        const filteredResults = result.results.filter(r =>
+          handles.some(h => h.toLowerCase() === r.handle.toLowerCase())
         );
-        const subData = subRes.data;
-        if (subData.status === 'OK' && subData.result) {
-          const contestSubs = subData.result.filter(sub =>
-            Number(sub.contestId) === Number(contestId) &&
-            sub.creationTimeSeconds >= startTime &&
-            sub.creationTimeSeconds <= upperBound &&
-            sub.verdict === 'OK'
+        return {
+          success: true,
+          ...result,
+          results: filteredResults
+        };
+      } else {
+        console.log(`⚠️ Tier 2 attempt ${attempt} failed: ${data.comment}`);
+      }
+    } catch (error) {
+      console.log(`⚠️ Tier 2 attempt ${attempt} error: ${error.message}`);
+    }
+    if (attempt < maxRetries) {
+      const delay = Math.pow(2, attempt) * 1000;
+      console.log(`⏳ Retrying in ${delay/1000}s...`);
+      await sleep(delay);
+    }
+  }
+  console.log('❌ Tier 2 all attempts failed');
+  return { success: false, error: 'All Tier 2 attempts failed' };
+}
+
+// ─── Tier 3: Slow fallback with concurrency ─────────────────────────────────
+async function tier3Fetch(contestId, handles, contestInfo) {
+  console.log('🐢 Tier 3: Slow fallback with submission scan...');
+  const results = [];
+  const concurrency = 5;
+  const baseDelay = 400;
+
+  for (let i = 0; i < handles.length; i += concurrency) {
+    const chunk = handles.slice(i, i + concurrency);
+    console.log(`📊 Processing chunk ${Math.floor(i/concurrency) + 1}/${Math.ceil(handles.length/concurrency)}`);
+
+    const chunkResults = await Promise.all(
+      chunk.map(async (handle) => {
+        try {
+          await sleep(baseDelay);
+
+          const response = await axios.get(
+            `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+            { timeout: 15000 }
           );
-          const solvedSet = new Set();
-          contestSubs.forEach(sub => {
-            if (sub.problem && sub.problem.index) {
-              solvedSet.add(sub.problem.index);
+          const data = response.data;
+
+          if (data.status !== 'OK') {
+            console.log(`⚠️ Failed to fetch submissions for ${handle}`);
+            return { handle, solved: 0, penalty: 0, rank: null };
+          }
+
+          const startTime = contestInfo.startTimeSeconds;
+          const endTime = contestInfo.phase === 'CODING'
+            ? Math.floor(Date.now() / 1000)
+            : startTime + contestInfo.durationSeconds;
+
+          const contestSubmissions = data.result.filter(sub =>
+            sub.contestId === parseInt(contestId) &&
+            sub.creationTimeSeconds >= startTime &&
+            sub.creationTimeSeconds <= endTime
+          );
+
+          const solvedProblems = new Set();
+          let penalty = 0;
+          const attempts = {};
+
+          const sortedSubs = contestSubmissions.sort(
+            (a, b) => a.creationTimeSeconds - b.creationTimeSeconds
+          );
+
+          for (const sub of sortedSubs) {
+            const problemId = sub.problem.index;
+            if (sub.verdict === 'OK' && !solvedProblems.has(problemId)) {
+              solvedProblems.add(problemId);
+              const timeFromStart = sub.creationTimeSeconds - startTime;
+              const wrongAttempts = attempts[problemId] || 0;
+              penalty += Math.floor(timeFromStart / 60) + (wrongAttempts * 20);
+            } else if (sub.verdict !== 'OK' && !solvedProblems.has(problemId)) {
+              attempts[problemId] = (attempts[problemId] || 0) + 1;
             }
-          });
-          const solvedCount = solvedSet.size;
-          if (solvedCount > totalProblems) totalProblems = solvedCount;
-          results.push({ handle, rank: null, solved: solvedCount, penalty: 0, totalProblems: 0 });
-        } else {
-          results.push({ handle, rank: null, solved: 0, penalty: 0, totalProblems: 0 });
+          }
+
+          console.log(`✅ ${handle}: ${solvedProblems.size} solved, ${penalty} penalty`);
+          return {
+            handle,
+            solved: solvedProblems.size,
+            penalty,
+            rank: null,
+            totalProblems: contestInfo.problems || 0
+          };
+        } catch (error) {
+          console.error(`❌ Error fetching submissions for ${handle}:`, error.message);
+          return { handle, solved: 0, penalty: 0, rank: null };
         }
-      } catch (err) {
-        console.error(`Fallback error for ${handle}:`, err.message);
-        results.push({ handle, rank: null, solved: 0, penalty: 0, totalProblems: 0 });
-      }
+      })
+    );
+
+    results.push(...chunkResults);
+    if (i + concurrency < handles.length) {
+      console.log(`⏳ Waiting 1s before next chunk...`);
+      await sleep(1000);
     }
+  }
 
-    // Determine total problems
-    if (totalProblems === 0) {
-      try {
-        const details = await getContestInfo(contestId); // we already have contestInfo, but need problem count – we can fetch details
-        // but we don't have problem count here; we can try standings count=1 again
-        const info = await axios.get(`https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`, { timeout: 8000 });
-        if (info.data && info.data.status === 'OK' && info.data.result) {
-          totalProblems = info.data.result.problems ? info.data.result.problems.length : 0;
-        } else {
-          totalProblems = results.reduce((max, r) => Math.max(max, r.solved), 0);
-        }
-      } catch (e) {
-        totalProblems = results.reduce((max, r) => Math.max(max, r.solved), 0);
-      }
+  const totalProblems = results.length > 0
+    ? Math.max(...results.map(r => r.totalProblems || 0))
+    : 0;
+
+  console.log(`✅ Tier 3 completed: ${results.length} results`);
+  return {
+    success: true,
+    results: results.map(r => ({ ...r, totalProblems })),
+    totalProblems,
+    phase: contestInfo.phase,
+    contest: contestInfo
+  };
+}
+
+// ─── Main function: getContestStandings (3‑tier) ────────────────────────────
+async function getContestStandings(contestId, handles) {
+  console.log(`📊 Fetching standings for contest ${contestId} with ${handles.length} handles`);
+
+  // STEP 1: Validate handles
+  const validHandles = await validateHandles(handles);
+  if (validHandles.length === 0) {
+    console.log('❌ No valid handles found');
+    return {
+      success: false,
+      error: 'No valid handles found',
+      results: handles.map(h => ({ handle: h, solved: 0, penalty: 0, rank: null })),
+      totalProblems: 0,
+      phase: 'UNKNOWN'
+    };
+  }
+
+  // STEP 2: Try Tier 1
+  const tier1Result = await tier1Fetch(contestId, validHandles);
+  if (tier1Result.success) {
+    console.log('✅ Returning Tier 1 results');
+    return tier1Result;
+  }
+  if (tier1Result.error === 'handles_not_found') {
+    console.log('⚠️ Tier 1: Some handles not in contest, continuing to Tier 2');
+  } else {
+    console.log(`⚠️ Tier 1 failed: ${tier1Result.error}, continuing to Tier 2`);
+  }
+
+  // STEP 3: Try Tier 2
+  const tier2Result = await tier2Fetch(contestId, validHandles);
+  if (tier2Result.success) {
+    console.log('✅ Returning Tier 2 results');
+    return tier2Result;
+  }
+  console.log(`⚠️ Tier 2 failed: ${tier2Result.error}, continuing to Tier 3`);
+
+  // STEP 4: Get contest info for Tier 3
+  let contestInfo;
+  try {
+    console.log('📡 Fetching contest info for fallback...');
+    const response = await axios.get(
+      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+      { timeout: 10000 }
+    );
+    if (response.data && response.data.status === 'OK') {
+      contestInfo = response.data.result.contest;
+      contestInfo.problems = response.data.result.problems ? response.data.result.problems.length : 0;
+      console.log(`✅ Contest info fetched: ${contestInfo.name}`);
+    } else {
+      throw new Error('Failed to fetch contest info');
     }
+  } catch (error) {
+    console.error('❌ Failed to fetch contest info:', error.message);
+    return {
+      success: false,
+      error: 'All tiers failed - cannot fetch contest info',
+      results: validHandles.map(h => ({ handle: h, solved: 0, penalty: 0, rank: null })),
+      totalProblems: 0,
+      phase: 'UNKNOWN'
+    };
+  }
 
-    results.forEach(r => r.totalProblems = totalProblems);
-    results.sort(compareContestEntries);
+  // STEP 5: Try Tier 3
+  const tier3Result = await tier3Fetch(contestId, validHandles, contestInfo);
+  console.log('✅ Returning Tier 3 results');
+  return tier3Result;
+}
 
-    const hasSolves = results.some(r => r.solved > 0);
-    if (!hasSolves) {
+// ─── Fallback for old code (kept for compatibility) ──────────────────────────
+async function handleSlowFallback(sock, from, contestId, handles, contestInfo) {
+  // This function is no longer used directly; the new getContestStandings handles everything.
+  // However, we keep a minimal wrapper to avoid breaking existing calls.
+  const result = await getContestStandings(contestId, handles);
+  if (result.success) {
+    const participants = result.results.filter(r => r.solved > 0).sort(compareContestEntries);
+    if (!participants.length) {
       await sock.sendMessage(from, { text: `😴 No group members have participated yet.\n\nContest: #${contestId}` });
       return;
     }
-
-    let output = `⚠️ *Fallback Results* (API unavailable)\n📝 Problems: ${totalProblems}\n────────────────────────────\n\n`;
+    let output = `📊 *Standings*\n📝 Problems: ${result.totalProblems}\n────────────────────────────\n\n`;
     const medals = ['🥇', '🥈', '🥉'];
-    results.filter(r => r.solved > 0).forEach((r, i) => {
+    participants.forEach((r, i) => {
       const medal = i < 3 ? medals[i] : '';
       const rankDisplay = r.rank || 'N/A';
-      output += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q) (Rank ${rankDisplay})\n`;
+      output += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${result.totalProblems} Q) (Rank ${rankDisplay})\n`;
     });
     await sock.sendMessage(from, { text: output });
-  } catch (error) {
-    console.error('Fallback error:', error);
-    await sock.sendMessage(from, { text: '❌ Fallback method failed. Please try again later.' });
+  } else {
+    await sock.sendMessage(from, { text: '❌ Failed to fetch standings. Please try again later.' });
   }
 }
 
@@ -879,7 +998,7 @@ async function checkAndAnnounceWinner(sock) {
         if (now - finishedAt <= 7200) {
           const standingsResult = await getContestStandings(lastId, handles);
           if (standingsResult.success) {
-            const results = standingsResult.data.results || [];
+            const results = standingsResult.results || [];
             const entries = results.filter(r => r.solved > 0).sort(compareContestEntries);
             if (entries.length) {
               const [winner] = entries;
@@ -1294,11 +1413,11 @@ async function startBot() {
 
           const standingsResult = await getContestStandings(contest.id, handles);
           if (!standingsResult.success) {
-            await handleSlowFallback(sock, chatId, contest.id, handles, contest);
+            await reply(`❌ Failed to fetch standings: ${standingsResult.error}`);
             continue;
           }
 
-          const data = standingsResult.data;
+          const data = standingsResult;
           const results = data.results || [];
           const totalProblems = data.totalProblems || 0;
           const phase = data.phase || 'FINISHED';
@@ -1372,11 +1491,11 @@ async function startBot() {
 
           const standingsResult = await getContestStandings(contestId, handles);
           if (!standingsResult.success) {
-            await handleSlowFallback(sock, chatId, contestId, handles, contestInfo);
+            await reply(`❌ Failed to fetch standings: ${standingsResult.error}`);
             continue;
           }
 
-          const data = standingsResult.data;
+          const data = standingsResult;
           const results = data.results || [];
           const totalProblems = data.totalProblems || 0;
           const phase = data.phase || 'FINISHED';
