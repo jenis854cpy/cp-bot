@@ -634,6 +634,34 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
+// ─── getContestInfo: fallback fetch of basic contest metadata ───────────────
+// Used when a contest isn't found in the cached contest.list (e.g. very new
+// or otherwise missing). Pulls metadata + problem count from contest.standings
+// with count=1, which bundles both in a single cheap call.
+async function getContestInfo(contestId, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`📡 getContestInfo: fetching contest ${contestId} (attempt ${attempt}/${maxRetries})...`);
+      const response = await axios.get(
+        `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
+        { timeout: 10000 }
+      );
+      if (response.data && response.data.status === 'OK' && response.data.result) {
+        const info = response.data.result.contest;
+        info.problems = response.data.result.problems ? response.data.result.problems.length : 0;
+        console.log(`✅ getContestInfo: fetched "${info.name}" (${info.problems} problems)`);
+        return info;
+      }
+      console.log(`⚠️ getContestInfo attempt ${attempt}: API returned non-OK status`);
+    } catch (error) {
+      console.log(`⚠️ getContestInfo attempt ${attempt} error: ${error.message}`);
+    }
+    if (attempt < maxRetries) await sleep(1000 * attempt);
+  }
+  console.error(`❌ getContestInfo: all attempts failed for contest ${contestId}`);
+  return null;
+}
+
 // =============================================================================
 // NEW STANDINGS FUNCTIONS (3‑TIER WITH VALIDATION & RETRIES)
 // =============================================================================
@@ -675,7 +703,7 @@ function buildResultsFromRows(data) {
     });
   }
 
-  return { results, totalProblems: problemCount, phase, contest: data.contest };
+  return { results, totalProblems: problemCount, phase, contest: data.contest, problems: data.problems || [] };
 }
 
 // ─── Validate handles ────────────────────────────────────────────────────────
@@ -713,23 +741,36 @@ async function validateHandles(handles) {
 
 // ─── Tier 1: Fast path with handles ─────────────────────────────────────────
 async function tier1Fetch(contestId, handles, timeout = 15000) {
-  console.log('🚀 Tier 1: Fetching with handles...');
+  console.log(`🚀 Tier 1: Fetching with handles (${handles.length} requested)...`);
   try {
     const handlesParam = handles.join(';');
-    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000`;
+    const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&handles=${handlesParam}&from=1&count=1000&showUnofficial=true`;
     const response = await axios.get(url, { timeout });
     const data = response.data;
 
     if (data.status === 'OK') {
-      console.log('✅ Tier 1 succeeded');
       const result = buildResultsFromRows(data.result);
-      return { success: true, ...result };
+
+      // CF can silently omit handles that aren't registered/ranked instead of
+      // erroring — status stays 'OK' but rows.length < handles.length.
+      // Treat that as a PARTIAL success so the caller falls through to Tier 2
+      // to recover the missing members, rather than undercounting silently.
+      const foundHandles = new Set(result.results.map(r => r.handle.toLowerCase()));
+      const missingHandles = handles.filter(h => !foundHandles.has(h.toLowerCase()));
+
+      if (missingHandles.length > 0) {
+        console.log(`⚠️ Tier 1: partial result — missing ${missingHandles.length}/${handles.length} handle(s): ${missingHandles.join(', ')}`);
+        return { success: false, partial: true, error: 'handles_missing_from_response', missingHandles, partialResult: { success: true, source: 'official standings', ...result } };
+      }
+
+      console.log(`✅ Tier 1 succeeded — all ${handles.length} handles found`);
+      return { success: true, source: 'official standings', ...result };
     } else {
       if (data.comment && data.comment.includes('handles: user not found')) {
-        console.log('⚠️ Tier 1: Some handles not found in contest');
+        console.log(`⚠️ Tier 1: handles not found in contest — comment: "${data.comment}"`);
         return { success: false, error: 'handles_not_found', comment: data.comment };
       } else {
-        console.log(`⚠️ Tier 1 failed: ${data.comment}`);
+        console.log(`⚠️ Tier 1 failed — API comment: "${data.comment}"`);
         return { success: false, error: data.comment || 'API error' };
       }
     }
@@ -744,35 +785,41 @@ async function tier2Fetch(contestId, handles, maxRetries = 3) {
   console.log('🚀 Tier 2: Fetching full standings...');
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1000`;
+      const url = `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1000&showUnofficial=true`;
       const response = await axios.get(url, { timeout: 30000 });
       const data = response.data;
 
       if (data.status === 'OK') {
-        console.log('✅ Tier 2 succeeded');
+        console.log(`✅ Tier 2 succeeded on attempt ${attempt}`);
         const result = buildResultsFromRows(data.result);
         // Filter only our handles
         const filteredResults = result.results.filter(r =>
           handles.some(h => h.toLowerCase() === r.handle.toLowerCase())
         );
+        const foundHandles = new Set(filteredResults.map(r => r.handle.toLowerCase()));
+        const stillMissing = handles.filter(h => !foundHandles.has(h.toLowerCase()));
+        if (stillMissing.length > 0) {
+          console.log(`⚠️ Tier 2: ${stillMissing.length} handle(s) not found in full standings either: ${stillMissing.join(', ')}`);
+        }
         return {
           success: true,
+          source: 'official standings',
           ...result,
           results: filteredResults
         };
       } else {
-        console.log(`⚠️ Tier 2 attempt ${attempt} failed: ${data.comment}`);
+        console.log(`⚠️ Tier 2 attempt ${attempt}/${maxRetries} failed — API comment: "${data.comment}"`);
       }
     } catch (error) {
-      console.log(`⚠️ Tier 2 attempt ${attempt} error: ${error.message}`);
+      console.log(`⚠️ Tier 2 attempt ${attempt}/${maxRetries} error: ${error.message}`);
     }
     if (attempt < maxRetries) {
       const delay = Math.pow(2, attempt) * 1000;
-      console.log(`⏳ Retrying in ${delay/1000}s...`);
+      console.log(`⏳ Tier 2: retrying in ${delay/1000}s...`);
       await sleep(delay);
     }
   }
-  console.log('❌ Tier 2 all attempts failed');
+  console.log('❌ Tier 2: all attempts failed');
   return { success: false, error: 'All Tier 2 attempts failed' };
 }
 
@@ -782,97 +829,124 @@ async function tier3Fetch(contestId, handles, contestInfo) {
   const results = [];
   const concurrency = 5;
   const baseDelay = 400;
+  const RETRY_DELAYS = [2000, 4000, 8000]; // exponential backoff for HTTP 429
 
   for (let i = 0; i < handles.length; i += concurrency) {
     const chunk = handles.slice(i, i + concurrency);
-    console.log(`📊 Processing chunk ${Math.floor(i/concurrency) + 1}/${Math.ceil(handles.length/concurrency)}`);
+    console.log(`📊 Tier 3: processing chunk ${Math.floor(i/concurrency) + 1}/${Math.ceil(handles.length/concurrency)}`);
 
     const chunkResults = await Promise.all(
       chunk.map(async (handle) => {
-        try {
-          await sleep(baseDelay);
+        let lastError = null;
 
-          const response = await axios.get(
-            `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-            { timeout: 15000 }
-          );
-          const data = response.data;
+        for (let retry = 0; retry <= RETRY_DELAYS.length; retry++) {
+          try {
+            await sleep(baseDelay);
 
-          if (data.status !== 'OK') {
-            console.log(`⚠️ Failed to fetch submissions for ${handle}`);
+            // Scope to this contest directly via &contestId= instead of
+            // pulling all of a user's submissions and filtering client-side.
+            const response = await axios.get(
+              `https://codeforces.com/api/user.status?handle=${handle}&contestId=${contestId}&from=1&count=10000`,
+              { timeout: 15000 }
+            );
+            const data = response.data;
+
+            if (data.status !== 'OK') {
+              console.log(`⚠️ Tier 3: failed to fetch submissions for ${handle} — comment: "${data.comment}"`);
+              return { handle, solved: 0, penalty: 0, rank: null };
+            }
+
+            const startTime = contestInfo.startTimeSeconds;
+            const endTime = contestInfo.phase === 'CODING'
+              ? Math.floor(Date.now() / 1000)
+              : startTime + contestInfo.durationSeconds;
+
+            // Don't count anything submitted after the contest window
+            // (upsolving/practice submissions are excluded here).
+            const contestSubmissions = data.result.filter(sub =>
+              sub.contestId === parseInt(contestId) &&
+              sub.creationTimeSeconds >= startTime &&
+              sub.creationTimeSeconds <= endTime
+            );
+
+            const solvedProblems = new Set();
+            let penalty = 0;
+            const attempts = {};
+
+            const sortedSubs = contestSubmissions.sort(
+              (a, b) => a.creationTimeSeconds - b.creationTimeSeconds
+            );
+
+            for (const sub of sortedSubs) {
+              const problemId = sub.problem.index;
+              if (sub.verdict === 'OK' && !solvedProblems.has(problemId)) {
+                solvedProblems.add(problemId);
+                const timeFromStart = sub.creationTimeSeconds - startTime;
+                const wrongAttempts = attempts[problemId] || 0;
+                penalty += Math.floor(timeFromStart / 60) + (wrongAttempts * 20);
+              } else if (sub.verdict !== 'OK' && !solvedProblems.has(problemId)) {
+                attempts[problemId] = (attempts[problemId] || 0) + 1;
+              }
+            }
+
+            console.log(`✅ Tier 3: ${handle} — ${solvedProblems.size} solved, ${penalty} penalty`);
+            return {
+              handle,
+              solved: solvedProblems.size,
+              penalty,
+              rank: null,
+              totalProblems: contestInfo.problems || 0
+            };
+          } catch (error) {
+            lastError = error;
+            const status = error.response?.status;
+            if (status === 429 && retry < RETRY_DELAYS.length) {
+              const delay = RETRY_DELAYS[retry];
+              console.log(`⏳ Tier 3: rate-limited (429) for ${handle}, backing off ${delay/1000}s (retry ${retry + 1}/${RETRY_DELAYS.length})...`);
+              await sleep(delay);
+              continue; // retry
+            }
+            // Non-429 error, or retries exhausted — give up on this handle
+            console.error(`❌ Tier 3: error fetching submissions for ${handle}: ${error.message}`);
             return { handle, solved: 0, penalty: 0, rank: null };
           }
-
-          const startTime = contestInfo.startTimeSeconds;
-          const endTime = contestInfo.phase === 'CODING'
-            ? Math.floor(Date.now() / 1000)
-            : startTime + contestInfo.durationSeconds;
-
-          const contestSubmissions = data.result.filter(sub =>
-            sub.contestId === parseInt(contestId) &&
-            sub.creationTimeSeconds >= startTime &&
-            sub.creationTimeSeconds <= endTime
-          );
-
-          const solvedProblems = new Set();
-          let penalty = 0;
-          const attempts = {};
-
-          const sortedSubs = contestSubmissions.sort(
-            (a, b) => a.creationTimeSeconds - b.creationTimeSeconds
-          );
-
-          for (const sub of sortedSubs) {
-            const problemId = sub.problem.index;
-            if (sub.verdict === 'OK' && !solvedProblems.has(problemId)) {
-              solvedProblems.add(problemId);
-              const timeFromStart = sub.creationTimeSeconds - startTime;
-              const wrongAttempts = attempts[problemId] || 0;
-              penalty += Math.floor(timeFromStart / 60) + (wrongAttempts * 20);
-            } else if (sub.verdict !== 'OK' && !solvedProblems.has(problemId)) {
-              attempts[problemId] = (attempts[problemId] || 0) + 1;
-            }
-          }
-
-          console.log(`✅ ${handle}: ${solvedProblems.size} solved, ${penalty} penalty`);
-          return {
-            handle,
-            solved: solvedProblems.size,
-            penalty,
-            rank: null,
-            totalProblems: contestInfo.problems || 0
-          };
-        } catch (error) {
-          console.error(`❌ Error fetching submissions for ${handle}:`, error.message);
-          return { handle, solved: 0, penalty: 0, rank: null };
         }
+
+        console.error(`❌ Tier 3: exhausted retries for ${handle}: ${lastError?.message}`);
+        return { handle, solved: 0, penalty: 0, rank: null };
       })
     );
 
     results.push(...chunkResults);
     if (i + concurrency < handles.length) {
-      console.log(`⏳ Waiting 1s before next chunk...`);
+      console.log(`⏳ Tier 3: waiting 1s before next chunk...`);
       await sleep(1000);
     }
   }
 
   const totalProblems = results.length > 0
     ? Math.max(...results.map(r => r.totalProblems || 0))
-    : 0;
+    : (contestInfo.problems || 0);
 
-  console.log(`✅ Tier 3 completed: ${results.length} results`);
+  console.log(`✅ Tier 3 completed: ${results.length} results, ${totalProblems} total problems`);
   return {
     success: true,
+    source: 'submission scan',
     results: results.map(r => ({ ...r, totalProblems })),
     totalProblems,
     phase: contestInfo.phase,
-    contest: contestInfo
+    contest: contestInfo,
+    problems: [] // not available from submission scan; handlers fall back gracefully
   };
 }
 
 // ─── Main function: getContestStandings (3‑tier) ────────────────────────────
-async function getContestStandings(contestId, handles) {
-  console.log(`📊 Fetching standings for contest ${contestId} with ${handles.length} handles`);
+// contestInfo (optional): pass the contest object you already have (e.g. from
+// contest.list, cached in the command handler) to skip the extra metadata
+// API call entirely. If omitted, it's fetched lazily only if/when Tier 3 is
+// reached (Tier 1/2 don't need it — they get contest+phase from CF directly).
+async function getContestStandings(contestId, handles, contestInfo = null) {
+  console.log(`📊 Fetching standings for contest ${contestId} with ${handles.length} handles${contestInfo ? ' (metadata pre-supplied)' : ''}`);
 
   // STEP 1: Validate handles
   const validHandles = await validateHandles(handles);
@@ -890,11 +964,14 @@ async function getContestStandings(contestId, handles) {
   // STEP 2: Try Tier 1
   const tier1Result = await tier1Fetch(contestId, validHandles);
   if (tier1Result.success) {
-    console.log('✅ Returning Tier 1 results');
-    return tier1Result;
+    console.log('✅ Returning Tier 1 results (all handles found)');
+    return finalizeStandings(tier1Result, validHandles);
   }
-  if (tier1Result.error === 'handles_not_found') {
-    console.log('⚠️ Tier 1: Some handles not in contest, continuing to Tier 2');
+
+  if (tier1Result.partial) {
+    console.log(`⚠️ Tier 1 partial (missing ${tier1Result.missingHandles.length} handle(s)) — merging with Tier 2`);
+  } else if (tier1Result.error === 'handles_not_found') {
+    console.log('⚠️ Tier 1: no handles found in contest, continuing to Tier 2');
   } else {
     console.log(`⚠️ Tier 1 failed: ${tier1Result.error}, continuing to Tier 2`);
   }
@@ -902,41 +979,67 @@ async function getContestStandings(contestId, handles) {
   // STEP 3: Try Tier 2
   const tier2Result = await tier2Fetch(contestId, validHandles);
   if (tier2Result.success) {
+    // If Tier 1 got SOME handles correctly (partial), prefer those rows
+    // (they already carry rank/penalty) and just fill in whichever ones
+    // Tier 1 was missing from Tier 2's full scan, instead of discarding
+    // Tier 1's results outright.
+    if (tier1Result.partial) {
+      const tier1Handles = new Set(tier1Result.partialResult.results.map(r => r.handle.toLowerCase()));
+      const mergedResults = [
+        ...tier1Result.partialResult.results,
+        ...tier2Result.results.filter(r => !tier1Handles.has(r.handle.toLowerCase()))
+      ];
+      console.log(`✅ Returning merged Tier 1 + Tier 2 results (${mergedResults.length}/${validHandles.length} handles covered)`);
+      return finalizeStandings({ ...tier2Result, results: mergedResults }, validHandles);
+    }
     console.log('✅ Returning Tier 2 results');
-    return tier2Result;
+    return finalizeStandings(tier2Result, validHandles);
   }
   console.log(`⚠️ Tier 2 failed: ${tier2Result.error}, continuing to Tier 3`);
 
-  // STEP 4: Get contest info for Tier 3
-  let contestInfo;
-  try {
-    console.log('📡 Fetching contest info for fallback...');
-    const response = await axios.get(
-      `https://codeforces.com/api/contest.standings?contestId=${contestId}&from=1&count=1`,
-      { timeout: 10000 }
-    );
-    if (response.data && response.data.status === 'OK') {
-      contestInfo = response.data.result.contest;
-      contestInfo.problems = response.data.result.problems ? response.data.result.problems.length : 0;
-      console.log(`✅ Contest info fetched: ${contestInfo.name}`);
-    } else {
-      throw new Error('Failed to fetch contest info');
+  // STEP 4: Get contest info for Tier 3 (skip the API call if already supplied)
+  let meta = contestInfo;
+  if (meta && meta.startTimeSeconds && meta.durationSeconds) {
+    console.log(`✅ Using pre-supplied contest metadata: ${meta.name}`);
+    // contest.list objects don't carry a problem count — try to recover one
+    // from whatever Tier 1/2 partial data we already fetched this run.
+    if (meta.problems === undefined) {
+      meta.problems = tier1Result.partialResult?.totalProblems || tier2Result.totalProblems || 0;
     }
-  } catch (error) {
-    console.error('❌ Failed to fetch contest info:', error.message);
-    return {
-      success: false,
-      error: 'All tiers failed - cannot fetch contest info',
-      results: validHandles.map(h => ({ handle: h, solved: 0, penalty: 0, rank: null })),
-      totalProblems: 0,
-      phase: 'UNKNOWN'
-    };
+  } else {
+    meta = await getContestInfo(contestId);
+    if (!meta) {
+      console.error('❌ All tiers failed — could not fetch contest metadata either');
+      return {
+        success: false,
+        error: 'All tiers failed - cannot fetch contest info',
+        results: validHandles.map(h => ({ handle: h, solved: 0, penalty: 0, rank: null })),
+        totalProblems: 0,
+        phase: 'UNKNOWN'
+      };
+    }
   }
 
   // STEP 5: Try Tier 3
-  const tier3Result = await tier3Fetch(contestId, validHandles, contestInfo);
+  const tier3Result = await tier3Fetch(contestId, validHandles, meta);
   console.log('✅ Returning Tier 3 results');
-  return tier3Result;
+  return finalizeStandings(tier3Result, validHandles);
+}
+
+// ─── finalizeStandings: shared post-processing for all tiers ────────────────
+// Ensures totalProblems is never shown as 0 when someone has actually solved
+// problems (falls back to the max solved count across results), and tags
+// every result set with a human-readable source label for the UI.
+function finalizeStandings(result, validHandles) {
+  if (!result.totalProblems) {
+    const maxSolved = Math.max(0, ...result.results.map(r => r.solved || 0));
+    if (maxSolved > 0) {
+      console.log(`⚠️ totalProblems unavailable from API — falling back to max solved count (${maxSolved})`);
+      result.totalProblems = maxSolved;
+    }
+  }
+  if (!result.source) result.source = 'official standings';
+  return result;
 }
 
 // ─── Fallback for old code (kept for compatibility) ──────────────────────────
@@ -1411,7 +1514,10 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contest.name}*...\n_May take a few seconds_`);
 
-          const standingsResult = await getContestStandings(contest.id, handles);
+          // Pass the contest object we already have (from contest.list) as
+          // contestInfo — this skips the redundant metadata API call inside
+          // getContestStandings if Tier 1/2 fail and Tier 3 is needed.
+          const standingsResult = await getContestStandings(contest.id, handles, contest);
           if (!standingsResult.success) {
             await reply(`❌ Failed to fetch standings: ${standingsResult.error}`);
             continue;
@@ -1426,11 +1532,12 @@ async function startBot() {
 
           const problems = data.problems || [];
           const problemLetters = problems.map(p => p.index).join(" ");
+          const isEstimated = data.source === 'submission scan';
 
           let text = `${isLiveContest ? "🟢 *LIVE*" : "📊"} *${contest.name}*\n`;
           text += `📅 ${formatIST(contest.startTimeSeconds)}\n`;
           text += `⏱ Duration: ${formatDuration(contest.durationSeconds)}\n`;
-          if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
+          if (totalProblems) text += `📝 Problems: ${totalProblems}${problemLetters ? ` (${problemLetters})` : ''}\n`;
           text += `${"─".repeat(28)}\n\n`;
 
           if (!participants.length) {
@@ -1439,9 +1546,10 @@ async function startBot() {
             const medals = ['🥇', '🥈', '🥉'];
             participants.forEach((r, i) => {
               const medal = i < 3 ? medals[i] : '';
-              const rankDisplay = isLiveContest ? 'N/A' : (r.rank || 'N/A');
+              const rankDisplay = (isLiveContest || isEstimated) ? 'N/A' : (r.rank || 'N/A');
               text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q) (Rank ${rankDisplay})\n`;
             });
+            text += `\n${isEstimated ? '⚠️ _(via submission scan – rank unavailable)_' : '✅ _(via official standings)_'}`;
           }
           await reply(text.trim());
         }
@@ -1489,7 +1597,9 @@ async function startBot() {
 
           await reply(`⏳ Fetching standings for *${contestInfo.name}*...\n_May take a few seconds_`);
 
-          const standingsResult = await getContestStandings(contestId, handles);
+          // Pass the contestInfo we already resolved (from contest.list or
+          // getContestInfo fallback) to skip the redundant metadata API call.
+          const standingsResult = await getContestStandings(contestId, handles, contestInfo);
           if (!standingsResult.success) {
             await reply(`❌ Failed to fetch standings: ${standingsResult.error}`);
             continue;
@@ -1503,6 +1613,7 @@ async function startBot() {
 
           const problems = data.problems || [];
           const problemLetters = problems.map(p => p.index).join(" ");
+          const isEstimated = data.source === 'submission scan';
 
           let statusEmoji = "📊";
           if (contestInfo.phase === "CODING") statusEmoji = "🟢 *LIVE*";
@@ -1512,7 +1623,7 @@ async function startBot() {
           let text = `${statusEmoji} *${contestInfo.name}*\n`;
           text += `📅 ${formatIST(contestInfo.startTimeSeconds)}\n`;
           text += `⏱ Duration: ${formatDuration(contestInfo.durationSeconds)}\n`;
-          if (totalProblems) text += `📝 Problems: ${totalProblems} (${problemLetters})\n`;
+          if (totalProblems) text += `📝 Problems: ${totalProblems}${problemLetters ? ` (${problemLetters})` : ''}\n`;
           text += `${"─".repeat(28)}\n\n`;
 
           if (!participants.length) {
@@ -1521,9 +1632,10 @@ async function startBot() {
             const medals = ['🥇', '🥈', '🥉'];
             participants.forEach((r, i) => {
               const medal = i < 3 ? medals[i] : '';
-              const rankDisplay = r.rank || 'N/A';
+              const rankDisplay = isEstimated ? 'N/A' : (r.rank || 'N/A');
               text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q) (Rank ${rankDisplay})\n`;
             });
+            text += `\n${isEstimated ? '⚠️ _(via submission scan – rank unavailable)_' : '✅ _(via official standings)_'}`;
           }
           text += `\n🔗 https://codeforces.com/contest/${contestId}`;
           await reply(text.trim());
