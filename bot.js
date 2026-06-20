@@ -996,7 +996,8 @@ function formatContestStandings(results, totalProblems, isLive, contestInfo) {
   text += `${"─".repeat(28)}\n\n`;
 
   const active = results.filter(r => r.solved > 0).sort(compareContestEntries);
-  const zero = results.filter(r => r.solved === 0);
+
+  // Removed the "zero solves" section entirely – members with 0 solves are not listed.
 
   if (active.length === 0) {
     text += `😴 No group members have participated yet.\n\n`;
@@ -1008,17 +1009,6 @@ function formatContestStandings(results, totalProblems, isLive, contestInfo) {
       text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q) | Rank ${rankDisplay}\n`;
     });
     text += '\n';
-  }
-
-  if (zero.length > 0) {
-    text += `💤 ${zero.length} member${zero.length > 1 ? 's' : ''} with 0 solves.\n`;
-    if (zero.length <= 10) {
-      zero.forEach(r => {
-        text += `   • ${r.handle}\n`;
-      });
-    } else {
-      text += `   (${zero.length} members total)\n`;
-    }
   }
 
   return text.trim();
@@ -1451,7 +1441,8 @@ async function startBot() {
 
           const isLiveContest = result.phase === 'CODING';
           const output = formatContestStandings(result.results, result.totalProblems, isLiveContest, contest);
-          await reply(output);
+          // Append contest link
+          await reply(output + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
         }
 
         // ── // contest ──────────────────────────────────────────────────
