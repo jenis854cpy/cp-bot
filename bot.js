@@ -110,14 +110,6 @@ function getAllHandles(groupData) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── Codeforces Rate Limiter + 429 Auto-Retry (global, all axios calls) ──────
-// CF enforces an informal request-rate limit per IP. Bursts of calls (handle
-// validation + Tier 1 + Tier 2 + background winner/reminder checks all hitting
-// CF around the same time) can trigger 429s. Tier 1 previously had ZERO retry
-// logic, so a single 429 there silently pushed every // solved and // contest
-// call down to Tier 3 (submission scan), which is why rank showed N/A and the
-// result changed every time. This wraps the shared axios instance once, so
-// every codeforces.com request — anywhere in this file — gets spaced out and
-// auto-retried on 429, with no need to touch each call site individually.
 let lastCFRequestAt = 0;
 const CF_MIN_GAP_MS = 350;
 
@@ -424,22 +416,38 @@ async function getCodeChefUpcoming() {
   } catch { return []; }
 }
 
-// ─── AtCoder: Clist fallback ─────────────────────────────────────────────────
-async function getAtCoderFromClist() {
+// ─── AtCoder via Clist (RELIABLE) ────────────────────────────────────────────
+async function getAtCoderUpcoming() {
   try {
-    const res = await axios.get("https://clist.by/api/v4/contest/", {
-      params: {
-        resource: "atcoder.jp",
-        start__gt: new Date().toISOString(),
-        order_by: "start",
-        limit: 10,
-        format: "json",
-      },
-      headers: { Authorization: "ApiKey jenis854cpy:YOUR_API_KEY" }, // replace with your key
-      timeout: 10000,
-    });
+    // Use environment variable for API key; fallback to the one you provided for demo
+    const CLIST_API_KEY = process.env.CLIST_API_KEY || "fddfa6592cd15f600f7abadeb8c74b36836322b2";
+    const CLIST_USERNAME = "jenis854cpy";
 
-    return (res.data?.objects || []).map((c) => ({
+    const res = await axios.get(
+      "https://clist.by/api/v4/contest/",
+      {
+        params: {
+          resource: "atcoder.jp",
+          start__gt: new Date().toISOString(), // only future contests
+          order_by: "start",
+          limit: 10,
+          format: "json",
+        },
+        headers: {
+          Authorization: `ApiKey ${CLIST_USERNAME}:${CLIST_API_KEY}`,
+        },
+        timeout: 15000,
+      }
+    );
+
+    const data = res.data?.objects || [];
+    if (!data.length) {
+      console.log("[AtCoder] No upcoming contests found via Clist.");
+      return [];
+    }
+
+    console.log(`[AtCoder] Found ${data.length} upcoming contests via Clist.`);
+    return data.map((c) => ({
       id: `at-${c.id}`,
       platform: "AtCoder",
       name: c.event,
@@ -447,60 +455,13 @@ async function getAtCoderFromClist() {
       durationSeconds: c.duration,
       url: c.href,
     }));
-  } catch (e) {
-    console.error("[AtCoder Clist] error:", e.message);
+  } catch (error) {
+    console.error("[AtCoder] Clist error:", error.message);
     return [];
   }
 }
 
-// ─── Primary AtCoder function ────────────────────────────────────────────────
-async function getAtCoderUpcoming() {
-  try {
-    const res = await axios.get(
-      "https://competeapi.vercel.app/contests/upcoming/",
-      { timeout: 10000 }
-    );
-    const now = Date.now();
-
-    const raw = (res.data || []).filter(
-      (c) => c.site?.toLowerCase() === "atcoder"
-    );
-
-    console.log(`[AtCoder] competeapi entries: ${raw.length}`);
-    if (raw.length > 0) console.log("[AtCoder] Sample:", raw[0]);
-
-    if (raw.length === 0) {
-      console.log("[AtCoder] Falling back to Clist...");
-      return await getAtCoderFromClist();
-    }
-
-    return raw
-      .map((c) => {
-        const title    = c.title ?? c.name ?? c.event ?? "unknown";
-        let   start    = c.startTime ?? c.start ?? c.start_time ?? 0;
-        const duration = c.duration ?? c.length ?? 0;
-
-        if (start > 1e12) start = Math.floor(start / 1000); // ms → s
-
-        return {
-          id: `at-${title.replace(/[^a-zA-Z0-9]/g, "-")}`,
-          platform: "AtCoder",
-          name: title,
-          startTimeSeconds: start,
-          durationSeconds: Math.floor(duration / 1000),
-          url: `https://atcoder.jp/contests/${title}`,
-        };
-      })
-      .filter((c) => c.startTimeSeconds > Math.floor(now / 1000))
-      .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
-      .slice(0, 10);
-
-  } catch (e) {
-    console.error("[AtCoder] Primary API error:", e.message);
-    return getAtCoderFromClist();
-  }
-}
-
+// ─── LeetCode ──────────────────────────────────────────────────────────────────
 async function getLeetCodeUpcoming() {
   try {
     const res = await axios.post(
@@ -675,9 +636,6 @@ function ordinal(n) {
 }
 
 // ─── getContestInfo: fallback fetch of basic contest metadata ───────────────
-// Used when a contest isn't found in the cached contest.list (e.g. very new
-// or otherwise missing). Pulls metadata + problem count from contest.standings
-// with count=1, which bundles both in a single cheap call.
 async function getContestInfo(contestId, maxRetries = 2) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -981,10 +939,6 @@ async function tier3Fetch(contestId, handles, contestInfo) {
 }
 
 // ─── Main function: getContestStandings (3‑tier) ────────────────────────────
-// contestInfo (optional): pass the contest object you already have (e.g. from
-// contest.list, cached in the command handler) to skip the extra metadata
-// API call entirely. If omitted, it's fetched lazily only if/when Tier 3 is
-// reached (Tier 1/2 don't need it — they get contest+phase from CF directly).
 async function getContestStandings(contestId, handles, contestInfo = null) {
   console.log(`📊 Fetching standings for contest ${contestId} with ${handles.length} handles${contestInfo ? ' (metadata pre-supplied)' : ''}`);
 
@@ -1067,9 +1021,6 @@ async function getContestStandings(contestId, handles, contestInfo = null) {
 }
 
 // ─── finalizeStandings: shared post-processing for all tiers ────────────────
-// Ensures totalProblems is never shown as 0 when someone has actually solved
-// problems (falls back to the max solved count across results), and tags
-// every result set with a human-readable source label for the UI.
 function finalizeStandings(result, validHandles) {
   if (!result.totalProblems) {
     const maxSolved = Math.max(0, ...result.results.map(r => r.solved || 0));
