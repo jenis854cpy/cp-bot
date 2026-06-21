@@ -213,6 +213,51 @@ async function getCFUsers(handles) {
   } catch { return []; }
 }
 
+// ─── Problem Suggestion ────────────────────────────────────────────────────────
+// The full CF problemset is large (~10k problems) but barely changes, so it's
+// cached in memory for an hour instead of re-fetched on every `// suggest`.
+let problemSetCache = { data: null, fetchedAt: 0 };
+const PROBLEMSET_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+async function getCFProblemSet() {
+  const now = Date.now();
+  if (problemSetCache.data && now - problemSetCache.fetchedAt < PROBLEMSET_CACHE_TTL) {
+    return problemSetCache.data;
+  }
+  try {
+    const res = await axios.get("https://codeforces.com/api/problemset.problems", { timeout: 15000 });
+    if (res.data?.status !== "OK") return problemSetCache.data || [];
+    const problems = res.data.result?.problems || [];
+    problemSetCache = { data: problems, fetchedAt: now };
+    return problems;
+  } catch (e) {
+    console.error("Error fetching CF problemset:", e.message);
+    return problemSetCache.data || []; // serve stale cache rather than nothing, if we have one
+  }
+}
+
+// Picks a random problem at the exact requested rating. If none exist at that
+// exact rating, falls back to the closest available rating within ±200 so the
+// command still returns something useful instead of a flat "not found".
+async function getRandomProblemByRating(rating) {
+  const problems = await getCFProblemSet();
+  const rated = problems.filter((p) => p.rating && p.contestId && p.index);
+  if (!rated.length) return null;
+
+  let pool = rated.filter((p) => p.rating === rating);
+  if (!pool.length) {
+    const withDiff = rated
+      .map((p) => ({ p, diff: Math.abs(p.rating - rating) }))
+      .filter((x) => x.diff <= 200)
+      .sort((a, b) => a.diff - b.diff);
+    if (!withDiff.length) return null;
+    const closestDiff = withDiff[0].diff;
+    pool = withDiff.filter((x) => x.diff === closestDiff).map((x) => x.p);
+  }
+
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 // ─── Streak ──────────────────────────────────────────────────────────────────
 function toISTDateStr(unixSeconds) {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -1539,6 +1584,39 @@ async function startBot() {
           await reply(output + promoText + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
         }
 
+        // ── // suggest ─────────────────────────────────────────────────────
+        else if (command.startsWith("// suggest")) {
+          const arg = body.slice(10).trim();
+          const rating = parseInt(arg, 10);
+
+          if (!arg || isNaN(rating) || rating < 800 || rating > 3500 || rating % 100 !== 0) {
+            await reply(
+              "❌ Usage: `// suggest <rating>`\n" +
+              "Rating must be a multiple of 100, between 800 and 3500.\n" +
+              "Example: `// suggest 1800`"
+            );
+            continue;
+          }
+
+          await reply(`🔎 Finding a ${rating}-rated problem...`);
+
+          const problem = await getRandomProblemByRating(rating);
+          if (!problem) {
+            await reply(`❌ Couldn't find any problem near rating ${rating}. Try a different value.`);
+            continue;
+          }
+
+          const link = `https://codeforces.com/problemset/problem/${problem.contestId}/${problem.index}`;
+          const tags = problem.tags?.length ? `\n🏷️ ${problem.tags.slice(0, 5).join(", ")}` : "";
+          const note = problem.rating !== rating ? `\n_(closest match — exact ${rating} not found right now)_` : "";
+
+          await reply(
+            `🎯 *${problem.name}*\n` +
+            `⭐ Rating: ${problem.rating}${tags}\n` +
+            `🔗 ${link}${note}`
+          );
+        }
+
         // ── // contest ──────────────────────────────────────────────────
         else if (command.startsWith("// contest ")) {
           const input = body.slice(10).trim();
@@ -1811,6 +1889,7 @@ async function startBot() {
             `📅 \`// upcoming\`\n   _Next CF, LC, CC & AtCoder contests_\n\n` +
             `🧩 \`// solved\`\n   _Who solved what in last contest_\n\n` +
             `🏁 \`// contest <id>\`\n   _Group standings for any contest_\n   _eg. // contest 1790_\n\n` +
+            `🎲 \`// suggest <rating>\`\n   _Best CF problem at that rating_\n   _eg. // suggest 1800_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 04 ]  DAILY TRACKING*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
