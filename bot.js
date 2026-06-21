@@ -44,6 +44,24 @@ const CFData = mongoose.model("CFData",
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
+// One document per CF handle (not per group) — the same handle can be
+// registered in multiple groups and we never want to fetch/store its
+// submissions twice. `// delta7` reads only from this collection.
+const SolveHistory = mongoose.model("SolveHistory",
+  new mongoose.Schema({
+    handle: { type: String, required: true, unique: true },
+    solves: {
+      type: [{
+        key: String,        // `${contestId}-${index}`, same dedupe key getDelta7 uses
+        rating: Number,
+        points: Number,
+        solvedAt: Number,   // submission's real creationTimeSeconds, not discovery time
+      }],
+      default: [],
+    },
+    lastSynced: { type: Date, default: null },
+  }));
+
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
 async function useMongoAuthState() {
   const writeData = async (key, data) => {
@@ -1303,6 +1321,82 @@ async function getDelta7(handles) {
   return results.sort((a, b) => b.points - a.points || b.count - a.count);
 }
 
+// ─── Background Solve-History Sync ─────────────────────────────────────────────
+// Keeps SolveHistory (one doc per handle) up to date so `// delta7` can read
+// straight from MongoDB with zero CF API calls in the command path.
+//
+// Always walks handles in batches of 2 with a 1.5s gap between batches —
+// same pacing as the old live getDelta7 — whether this is the full periodic
+// sweep, the one-off startup sweep, or a single-handle sync triggered by
+// `// add`. Nothing here is incremental: every call re-fetches each handle's
+// latest 100 submissions from CF and re-derives the 7-day window from their
+// real `creationTimeSeconds`, so it's never "only what happened since the
+// bot started watching" — it's always their true last 7 days.
+async function syncSolveHistory(specificHandles) {
+  const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
+
+  let handles;
+  if (specificHandles && specificHandles.length) {
+    handles = specificHandles;
+  } else {
+    const groups = await CFData.find({}).lean();
+    handles = [];
+    for (const g of groups)
+      for (const list of Object.values(g.members || {}))
+        for (const h of list)
+          if (!handles.includes(h)) handles.push(h);
+  }
+
+  if (!handles.length) return;
+  console.log(`🔄 syncSolveHistory: syncing ${handles.length} handle(s)...`);
+
+  for (let i = 0; i < handles.length; i += 2) {
+    const batch = handles.slice(i, i + 2);
+    await Promise.all(batch.map(async (handle) => {
+      try {
+        const res = await axios.get(
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+          { timeout: 10000 }
+        );
+        const subs = res.data.result || [];
+
+        let doc = await SolveHistory.findOne({ handle });
+        if (!doc) doc = new SolveHistory({ handle, solves: [] });
+
+        const existingKeys = new Set(doc.solves.map((s) => s.key));
+        for (const s of subs) {
+          if (s.verdict !== "OK" || !s.problem) continue;
+          const key = `${s.problem.contestId}-${s.problem.index}`;
+          if (existingKeys.has(key)) continue; // already recorded, even if CF shows repeat attempts
+          existingKeys.add(key);
+          const rating = s.problem.rating || 0;
+          doc.solves.push({
+            key,
+            rating,
+            points: calculatePointsForRating(rating),
+            solvedAt: s.creationTimeSeconds,
+          });
+        }
+
+        // Auto-expiry: this is the only place old entries get dropped —
+        // happens as a side effect of every sync write, no separate cleanup job.
+        const nowSec = Math.floor(Date.now() / 1000);
+        doc.solves = doc.solves.filter((s) => nowSec - s.solvedAt <= SEVEN_DAYS_SEC);
+
+        doc.lastSynced = new Date();
+        await doc.save();
+      } catch (e) {
+        // One bad handle (network hiccup, invalid handle) must not wipe its
+        // existing stored data or abort the rest of the batch.
+        console.error(`⚠️ syncSolveHistory failed for ${handle}:`, e.message);
+      }
+    }));
+    if (i + 2 < handles.length) await sleep(1500);
+  }
+
+  console.log(`✅ syncSolveHistory: done (${handles.length} handle(s))`);
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function rankEmoji(rank) {
   if (!rank) return "⚫";
@@ -1360,6 +1454,7 @@ function startCronJobs() {
   console.log("✅ Cron jobs started (single instance — survives reconnects)");
   setInterval(() => { if (activeSock) checkAndSendReminders(activeSock); }, 10 * 60 * 1000);
   setInterval(() => { if (activeSock) checkAndAnnounceWinner(activeSock); }, 5 * 60 * 1000);
+  setInterval(() => { syncSolveHistory(); }, 12 * 60 * 1000); // full sweep, batch-of-2 pacing, no sock needed
 }
 
 async function startBot() {
@@ -1389,6 +1484,9 @@ async function startBot() {
 
       console.log("🚀 Running immediate reminder check...");
       checkAndSendReminders(sock);
+
+      console.log("🚀 Running immediate solve-history sync (batch-of-2 pacing)...");
+      syncSolveHistory();
 
       setTimeout(() => {
         if (activeSock !== sock) return; // a newer connection has since taken over
@@ -1424,6 +1522,7 @@ async function startBot() {
           await reply(`🔍 Verifying ${args.length} handle(s)...`);
           if (!groupData.members[senderId]) groupData.members[senderId] = [];
           const results = [];
+          const newlyAdded = [];
           let added = 0, failed = 0;
           for (const h of args) {
             await sleep(300);
@@ -1434,11 +1533,17 @@ async function startBot() {
             }
             groupData.members[senderId].push(userInfo.handle);
             results.push(`✅ ${rankEmoji(userInfo.rank)} *${userInfo.handle}* — ${userInfo.rating ?? "Unrated"} (${userInfo.rank})`);
+            newlyAdded.push(userInfo.handle);
             added++;
           }
           await saveGroupData(chatId, groupData);
+          // Fire-and-forget: don't make the registration reply wait on CF's
+          // submissions endpoint. Same batch-of-2 pacing as every other sync,
+          // it just runs against a 1-3 handle list here instead of the whole group.
+          if (newlyAdded.length) syncSolveHistory(newlyAdded);
           let text = `*Registration Results:*\n\n` + results.join("\n");
           if (args.length > 1) text += `\n\n👥 ${added} added${failed ? `, ${failed} failed` : ""}`;
+          if (newlyAdded.length) text += `\n\n⏳ _Fetching last 7 days of solves for ${newlyAdded.length > 1 ? "these handles" : "this handle"} — ready for \`// delta7\` shortly._`;
           await reply(text);
         }
 
@@ -1850,10 +1955,25 @@ async function startBot() {
         else if (command === "// delta7") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
-          const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
-          await reply(`⏳ Fetching last 100 submissions for *${handles.length}* members...\n_May take ~${estimatedSeconds} seconds_`);
 
-          const results = await getDelta7(handles);
+          // Zero axios calls, zero sleep() here — all CF fetching happens in
+          // the background sync. This is a single in-memory MongoDB read.
+          const docs = await SolveHistory.find({ handle: { $in: handles } }).lean();
+          const docByHandle = new Map(docs.map((d) => [d.handle, d]));
+
+          const nowSec = Math.floor(Date.now() / 1000);
+          const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
+          const unsynced = [];
+          const results = handles.map((handle) => {
+            const doc = docByHandle.get(handle);
+            if (!doc) { unsynced.push(handle); return { handle, points: 0, count: 0 }; }
+            // Re-filter at read time as a cheap safety net in case the last
+            // sync is a few minutes stale — pure in-memory filter, no network.
+            const fresh = doc.solves.filter((s) => nowSec - s.solvedAt <= SEVEN_DAYS_SEC);
+            const points = fresh.reduce((sum, s) => sum + s.points, 0);
+            return { handle, points, count: fresh.length };
+          }).sort((a, b) => b.points - a.points || b.count - a.count);
+
           const active = results.filter((r) => r.points > 0);
 
           let text = `📈 *Delta7 (Last 7 Days)*\n${"─".repeat(28)}\n📅 Rolling 7-day points\n\n`;
@@ -1865,6 +1985,10 @@ async function startBot() {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
               text += `${medal} *${r.handle}* — ${r.points} pts (${r.count} problem${r.count>1?'s':''})\n`;
             });
+          }
+
+          if (unsynced.length) {
+            text += `\n⏳ _New member${unsynced.length > 1 ? "s" : ""} (${unsynced.join(", ")}) will appear after the next sync._`;
           }
 
           await reply(text.trim());
