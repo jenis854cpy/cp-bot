@@ -236,12 +236,19 @@ async function getCFProblemSet() {
   }
 }
 
+// A handful of contests (old Technocup/educational rounds aimed at a
+// Russian-speaking audience) were never translated, so CF's API returns
+// their name in Cyrillic instead of English. Exclude those from suggestions.
+function hasNonEnglishName(name) {
+  return /[\u0400-\u04FF]/.test(name || ""); // Cyrillic Unicode block
+}
+
 // Picks a random problem at the exact requested rating. If none exist at that
 // exact rating, falls back to the closest available rating within ±200 so the
 // command still returns something useful instead of a flat "not found".
 async function getRandomProblemByRating(rating) {
   const problems = await getCFProblemSet();
-  const rated = problems.filter((p) => p.rating && p.contestId && p.index);
+  const rated = problems.filter((p) => p.rating && p.contestId && p.index && !hasNonEnglishName(p.name));
   if (!rated.length) return null;
 
   let pool = rated.filter((p) => p.rating === rating);
@@ -1889,7 +1896,7 @@ async function startBot() {
             `📅 \`// upcoming\`\n   _Next CF, LC, CC & AtCoder contests_\n\n` +
             `🧩 \`// solved\`\n   _Who solved what in last contest_\n\n` +
             `🏁 \`// contest <id>\`\n   _Group standings for any contest_\n   _eg. // contest 1790_\n\n` +
-            `🎲 \`// suggest <rating>\`\n   _Best CF problem at that rating_\n   _eg. // suggest 1800_\n\n` +
+            `🎲 \`// suggest <rating>\`\n   _Random CF problem at that rating_\n   _eg. // suggest 1800_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 04 ]  DAILY TRACKING*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
