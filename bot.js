@@ -1783,11 +1783,11 @@ async function startBot() {
           await reply(`${output}\n\n🔗 https://codeforces.com/contest/${contestId}`);
         }
 
-        // ── // whosolvedtoday ──────────────────────────────────────────
-        else if (command.startsWith("// whosolvedtoday ")) {
-          const url = body.slice(18).trim();
+        // ── // today ─────────────────────────────────────────────────────
+        else if (command.startsWith("// today ")) {
+          const url = body.slice(9).trim();
           if (!url) {
-            await reply("❌ Usage: `// whosolvedtoday <problem_url>`\nExample: `// whosolvedtoday https://codeforces.com/contest/1790/problem/D`");
+            await reply("❌ Usage: `// today <problem_url>`\nExample: `// today https://codeforces.com/contest/1790/problem/D`");
             continue;
           }
           const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
@@ -1802,8 +1802,7 @@ async function startBot() {
             await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
             continue;
           }
-          const estimatedSeconds = Math.ceil(handles.length * 1.5 + (handles.length / 2) * 1.5);
-          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — may take ~${estimatedSeconds} seconds_`);
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — few seconds_`);
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
           const todayIST = new Date(Date.now() + IST_OFFSET_MS);
           todayIST.setHours(0, 0, 0, 0);
@@ -1861,7 +1860,7 @@ async function startBot() {
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
           if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
-          await reply(`⏳ Fetching streak for *${arg}*... _May take 10-15 seconds_`);
+          await reply(`⏳ Fetching streak for *${arg}*... _few seconds_`);
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
           const curFire = streakFire(streak.current);
@@ -1881,7 +1880,7 @@ async function startBot() {
         else if (command.startsWith("// info")) {
           const arg = body.slice(7).trim();
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
-          await reply(`⏳ Fetching info for *${arg}*...\n_May take 15-20 seconds_`);
+          await reply(`⏳ Fetching info for *${arg}*...\n_few seconds_`);
           const [info, qData] = await Promise.all([
             getCFUserInfo(arg),
             getCFUserInfoQ(arg),
@@ -1913,7 +1912,7 @@ async function startBot() {
           const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
           const [h1, h2] = args;
-          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_May take 20-30 seconds_`);
+          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_few seconds_`);
           const info1 = await getCFUserForCompare(h1);
           if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check the handle and try again.`); continue; }
           await sleep(500);
@@ -1983,7 +1982,7 @@ async function startBot() {
           } else {
             active.forEach((r, i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${r.handle}* — ${r.points} pts (${r.count} problem${r.count>1?'s':''})\n`;
+              text += `${medal} *${r.handle}* — ${r.points} pts, ${r.count} Q\n`;
             });
           }
 
@@ -2024,7 +2023,7 @@ async function startBot() {
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 04 ]  DAILY TRACKING*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
-            `✅ \`// whosolvedtoday <url>\`\n   _Who solved a problem today (IST)_\n\n` +
+            `✅ \`// today <url>\`\n   _Who solved a problem today (IST)_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 05 ]  HELP*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
