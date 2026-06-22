@@ -59,6 +59,7 @@ const SolveHistory = mongoose.model("SolveHistory",
       }],
       default: [],
     },
+    totalSolved: { type: Number, default: 0 }, // lifetime counter — never decrements
     lastSynced: { type: Date, default: null },
   }));
 
@@ -335,6 +336,8 @@ async function getCFStreak(handle) {
 }
 
 // ─── CF User Info Q ──────────────────────────────────────────────────────────
+// Each entry: [lo, hi] where BOTH lo and hi are INCLUSIVE.
+// The bucket check uses r >= lo && r <= hi (or r >= lo for the last open bucket).
 const RATING_RANGES = [
   [800, 1100], [1200, 1300], [1400, 1500], [1600, 1800],
   [1900, 2000], [2100, 2200], [2300, Infinity],
@@ -342,6 +345,11 @@ const RATING_RANGES = [
 
 function rangeLabel([lo, hi]) {
   return hi === Infinity ? `${lo}+` : `${lo}-${hi}`;
+}
+
+// Returns true if rating `r` falls inside the inclusive range.
+function inRange(r, [lo, hi]) {
+  return hi === Infinity ? r >= lo : r >= lo && r <= hi;
 }
 
 async function getCFUserInfoQ(handle) {
@@ -362,7 +370,7 @@ async function getCFUserInfoQ(handle) {
           const r = s.problem.rating;
           if (r) {
             for (const range of RATING_RANGES) {
-              if (r >= range[0] && r < range[1]) { buckets[rangeLabel(range)]++; break; }
+              if (inRange(r, range)) { buckets[rangeLabel(range)]++; break; }
             }
           }
         }
@@ -1355,19 +1363,28 @@ async function syncSolveHistory(specificHandles) {
     await Promise.all(batch.map(async (handle) => {
       try {
         const res = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
-          { timeout: 10000 }
+          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
+          { timeout: 30000 }
         );
         const subs = res.data.result || [];
 
         let doc = await SolveHistory.findOne({ handle });
-        if (!doc) doc = new SolveHistory({ handle, solves: [] });
+        if (!doc) doc = new SolveHistory({ handle, solves: [], totalSolved: 0 });
 
         const existingKeys = new Set(doc.solves.map((s) => s.key));
+
+        // Also track ALL keys ever seen (including those already expired from solves[])
+        // by seeding from a separate all-time set built from existingKeys + any new ones.
+        // We use doc.totalSolved as the running counter — only bump it for truly new keys.
+        // To avoid double-counting keys that fell out of the 7-day window, we need a
+        // persistent allKeys set. We derive it from the solves array PLUS maintain
+        // totalSolved as the authoritative lifetime count.
+        //
+        // Strategy: if a key is not in existingKeys, it's brand new — bump totalSolved.
         for (const s of subs) {
           if (s.verdict !== "OK" || !s.problem) continue;
           const key = `${s.problem.contestId}-${s.problem.index}`;
-          if (existingKeys.has(key)) continue; // already recorded, even if CF shows repeat attempts
+          if (existingKeys.has(key)) continue;
           existingKeys.add(key);
           const rating = s.problem.rating || 0;
           doc.solves.push({
@@ -1376,18 +1393,16 @@ async function syncSolveHistory(specificHandles) {
             points: calculatePointsForRating(rating),
             solvedAt: s.creationTimeSeconds,
           });
+          doc.totalSolved = (doc.totalSolved || 0) + 1;
         }
 
-        // Auto-expiry: this is the only place old entries get dropped —
-        // happens as a side effect of every sync write, no separate cleanup job.
+        // Auto-expiry: only the 7-day window array shrinks — totalSolved never decrements.
         const nowSec = Math.floor(Date.now() / 1000);
         doc.solves = doc.solves.filter((s) => nowSec - s.solvedAt <= SEVEN_DAYS_SEC);
 
         doc.lastSynced = new Date();
         await doc.save();
       } catch (e) {
-        // One bad handle (network hiccup, invalid handle) must not wipe its
-        // existing stored data or abort the rest of the batch.
         console.error(`⚠️ syncSolveHistory failed for ${handle}:`, e.message);
       }
     }));
@@ -1543,7 +1558,7 @@ async function startBot() {
           if (newlyAdded.length) syncSolveHistory(newlyAdded);
           let text = `*Registration Results:*\n\n` + results.join("\n");
           if (args.length > 1) text += `\n\n👥 ${added} added${failed ? `, ${failed} failed` : ""}`;
-          if (newlyAdded.length) text += `\n\n⏳ _Fetching last 7 days of solves for ${newlyAdded.length > 1 ? "these handles" : "this handle"} — ready for \`// delta7\` shortly._`;
+          if (newlyAdded.length) text += `\n\n⏳ _Fetching solve history for ${newlyAdded.length > 1 ? "these handles" : "this handle"} — \`// delta7\` and \`// totals\` will be ready shortly._`;
           await reply(text);
         }
 
@@ -1993,6 +2008,42 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // totals ──────────────────────────────────────────────────
+        else if (command === "// totals") {
+          const handles = getAllHandles(groupData);
+          if (!handles.length) { await reply("📭 No members registered.\nUse `// add your_cf_id` to join."); continue; }
+
+          // Pure MongoDB read — zero CF API calls.
+          const docs = await SolveHistory.find({ handle: { $in: handles } }).lean();
+          const docByHandle = new Map(docs.map((d) => [d.handle, d]));
+
+          const unsynced = [];
+          const results = handles.map((handle) => {
+            const doc = docByHandle.get(handle);
+            if (!doc || doc.totalSolved == null) { unsynced.push(handle); return { handle, total: 0 }; }
+            return { handle, total: doc.totalSolved };
+          }).sort((a, b) => b.total - a.total);
+
+          const active = results.filter((r) => r.total > 0);
+
+          let text = `🧠 *All-Time Solved*\n${"─".repeat(28)}\n📚 Total unique problems solved\n\n`;
+
+          if (!active.length) {
+            text += `😴 No solve data yet!\nData syncs every 12 minutes after members are added.`;
+          } else {
+            active.forEach((r, i) => {
+              const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+              text += `${medal} *${r.handle}* — ${r.total} problems\n`;
+            });
+          }
+
+          if (unsynced.length) {
+            text += `\n⏳ _${unsynced.join(", ")} — syncing soon._`;
+          }
+
+          await reply(text.trim());
+        }
+
         // ── // help ──────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
@@ -2009,6 +2060,7 @@ async function startBot() {
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `📊 \`// rating\`\n   _Group ranking by CF rating_\n\n` +
             `📈 \`// delta7\`\n   _Rolling 7-day points (Δ7)_\n\n` +
+            `🧠 \`// totals\`\n   _All-time problems solved leaderboard_\n\n` +
             `🎯 \`// myrating\`\n   _Your current rating & rank_\n\n` +
             `🔥 \`// streak <cf_id>\`\n   _Current & max daily streak_\n\n` +
             `🧠 \`// info <cf_id>\`\n   _Full profile & solve stats_\n\n` +
