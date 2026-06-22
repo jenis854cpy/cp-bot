@@ -1371,34 +1371,38 @@ async function syncSolveHistory(specificHandles) {
         let doc = await SolveHistory.findOne({ handle });
         if (!doc) doc = new SolveHistory({ handle, solves: [], totalSolved: 0 });
 
-        const existingKeys = new Set(doc.solves.map((s) => s.key));
-
-        // Also track ALL keys ever seen (including those already expired from solves[])
-        // by seeding from a separate all-time set built from existingKeys + any new ones.
-        // We use doc.totalSolved as the running counter — only bump it for truly new keys.
-        // To avoid double-counting keys that fell out of the 7-day window, we need a
-        // persistent allKeys set. We derive it from the solves array PLUS maintain
-        // totalSolved as the authoritative lifetime count.
+        // ── FIX: compute totalSolved from the FULL submission list each sync ──
+        // The old approach incremented doc.totalSolved only for keys absent from
+        // doc.solves[]. But doc.solves[] is pruned to 7 days, so any solve that
+        // aged out of the window would be "missing" from existingKeys on the next
+        // sync and counted again — causing runaway inflation (tourist: 13k+).
         //
-        // Strategy: if a key is not in existingKeys, it's brand new — bump totalSolved.
+        // Correct approach: build a deduplicated set of ALL unique AC keys from
+        // the full user.status response (count=10000) on every sync. This is the
+        // true lifetime unique-problem count and never double-counts.
+        const allUniqueKeys = new Set();
+        const sevenDaySolves = [];
+        const nowSec = Math.floor(Date.now() / 1000);
+
         for (const s of subs) {
           if (s.verdict !== "OK" || !s.problem) continue;
           const key = `${s.problem.contestId}-${s.problem.index}`;
-          if (existingKeys.has(key)) continue;
-          existingKeys.add(key);
+          if (allUniqueKeys.has(key)) continue; // dedupe: only first AC per problem
+          allUniqueKeys.add(key);
           const rating = s.problem.rating || 0;
-          doc.solves.push({
-            key,
-            rating,
-            points: calculatePointsForRating(rating),
-            solvedAt: s.creationTimeSeconds,
-          });
-          doc.totalSolved = (doc.totalSolved || 0) + 1;
+          // Only keep in the rolling 7-day array if solved recently
+          if (nowSec - s.creationTimeSeconds <= SEVEN_DAYS_SEC) {
+            sevenDaySolves.push({
+              key,
+              rating,
+              points: calculatePointsForRating(rating),
+              solvedAt: s.creationTimeSeconds,
+            });
+          }
         }
 
-        // Auto-expiry: only the 7-day window array shrinks — totalSolved never decrements.
-        const nowSec = Math.floor(Date.now() / 1000);
-        doc.solves = doc.solves.filter((s) => nowSec - s.solvedAt <= SEVEN_DAYS_SEC);
+        doc.totalSolved = allUniqueKeys.size; // always accurate — no incremental drift
+        doc.solves = sevenDaySolves;           // only last-7-days solves for delta7
 
         doc.lastSynced = new Date();
         await doc.save();
