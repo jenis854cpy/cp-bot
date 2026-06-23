@@ -1738,12 +1738,11 @@ async function startBot() {
           }
 
           const link = `https://codeforces.com/problemset/problem/${problem.contestId}/${problem.index}`;
-          const tags = problem.tags?.length ? `\n🏷️ ${problem.tags.slice(0, 5).join(", ")}` : "";
           const note = problem.rating !== rating ? `\n_(closest match — exact ${rating} not found right now)_` : "";
 
           await reply(
             `🎯 *${problem.name}*\n` +
-            `⭐ Rating: ${problem.rating}${tags}\n` +
+            `⭐ Rating: ${problem.rating}\n` +
             `🔗 ${link}${note}`
           );
         }
