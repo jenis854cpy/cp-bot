@@ -44,21 +44,6 @@ const CFData = mongoose.model("CFData",
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
-// Controls which groups the bot is allowed to reply in. A group starts
-// "pending" the first time anyone sends a `//` command in it, the owner
-// gets DM'd about it, and the bot stays silent until status becomes
-// "allowed" (every command works) or "blocked" (stays silent forever,
-// no repeat notifications).
-const GroupAccess = mongoose.model("GroupAccess",
-  new mongoose.Schema({
-    chatId: { type: String, required: true, unique: true },
-    groupName: { type: String, default: "" },
-    status: { type: String, enum: ["pending", "allowed", "blocked"], default: "pending" },
-    requestedBy: { type: String, default: "" },
-    notifiedOwner: { type: Boolean, default: false },
-    createdAt: { type: Date, default: Date.now },
-  }));
-
 // One document per CF handle (not per group) — the same handle can be
 // registered in multiple groups and we never want to fetch/store its
 // submissions twice. `// delta7` reads only from this collection.
@@ -150,134 +135,6 @@ function getAllHandles(groupData) {
     for (const h of handles)
       if (!all.includes(h)) all.push(h);
   return all;
-}
-
-// ─── Group Access Control ───────────────────────────────────────────────────
-// OWNER_ID env var: just your number, e.g. "919999999999" (no "+", no spaces).
-// We normalize it to a full WhatsApp JID here so it can be compared directly
-// against incoming chatId/senderId values.
-const OWNER_JID = process.env.OWNER_ID
-  ? (process.env.OWNER_ID.includes("@") ? process.env.OWNER_ID : `${process.env.OWNER_ID}@s.whatsapp.net`)
-  : null;
-
-if (OWNER_JID) {
-  console.log(`👤 Owner DM target configured: ${OWNER_JID}`);
-} else {
-  console.warn("⚠️ OWNER_ID env var not set — group-approval DM notifications will be skipped.");
-}
-
-// Strips WhatsApp's optional ":deviceId" suffix so JIDs compare reliably
-// regardless of which linked device sent the message.
-function normalizeJid(jid) {
-  if (!jid) return "";
-  return jid.split(":")[0].split("@")[0] + "@s.whatsapp.net";
-}
-
-// In-memory set of allowed group chatIds, kept in sync with Mongo so every
-// incoming message only needs a Set lookup, not a DB round-trip.
-let allowedGroupsCache = new Set();
-
-async function loadAllowedGroups() {
-  const docs = await GroupAccess.find({ status: "allowed" }).lean();
-  allowedGroupsCache = new Set(docs.map((d) => d.chatId));
-  console.log(`✅ Loaded ${allowedGroupsCache.size} allowed group(s)`);
-}
-
-function isGroupAllowed(chatId) {
-  return allowedGroupsCache.has(chatId);
-}
-
-// Called the first time an unapproved group sends a `//` command. Creates/
-// updates its pending record and DMs the owner exactly once per pending
-// group (won't re-notify on every subsequent message while still pending).
-async function handleUnapprovedGroup(sock, chatId, senderId) {
-  try {
-    const existing = await GroupAccess.findOne({ chatId }).lean();
-    if (existing?.status === "blocked") return;       // explicitly blocked — stay silent
-    if (existing?.notifiedOwner) return;               // already pending, owner already told
-
-    let groupName = "Unknown Group";
-    try {
-      const meta = await sock.groupMetadata(chatId);
-      groupName = meta?.subject || groupName;
-    } catch (e) { /* metadata fetch failed — fall back to "Unknown Group" */ }
-
-    await GroupAccess.findOneAndUpdate(
-      { chatId },
-      { $set: { groupName, status: "pending", requestedBy: senderId, notifiedOwner: true } },
-      { upsert: true }
-    );
-
-    const text =
-      `📩 *New group wants bot access*\n${"─".repeat(28)}\n\n` +
-      `Group: *${groupName}*\n` +
-      `Requested by: +${senderId.split("@")[0].split(":")[0]}\n` +
-      `ID:\n\`${chatId}\`\n\n` +
-      `Reply here:\n\`// allow ${chatId}\`\nor\n\`// block ${chatId}\``;
-
-    if (OWNER_JID) {
-      try {
-        await sock.sendMessage(OWNER_JID, { text });
-        console.log(`📨 Sent approval request for group "${groupName}" to owner (${OWNER_JID}).`);
-      } catch (e) {
-        console.error(`❌ Failed to DM owner about group "${groupName}" at ${OWNER_JID}:`, e.message);
-      }
-    } else {
-      console.warn(`⚠️ Group "${groupName}" is now pending but OWNER_ID isn't set, so no DM was sent. Check MongoDB's "groupaccesses" collection manually.`);
-    }
-  } catch (e) {
-    console.error("handleUnapprovedGroup error:", e.message);
-  }
-}
-
-// Owner-only DM commands: `// allow <id>`, `// block <id>`, `// pending`, `// groups`.
-async function handleOwnerCommand(sock, command, body, reply) {
-  if (command.startsWith("// allow ")) {
-    const target = body.slice(9).trim();
-    if (!target.endsWith("@g.us")) {
-      await reply("❌ Usage: `// allow <group_id>`\nCopy the ID from the request message.");
-      return;
-    }
-    const doc = await GroupAccess.findOneAndUpdate(
-      { chatId: target }, { $set: { status: "allowed" } }, { upsert: true, new: true }
-    );
-    allowedGroupsCache.add(target);
-    await reply(`✅ Allowed: *${doc?.groupName || target}*\nBot will now reply to every command there.`);
-    return;
-  }
-
-  if (command.startsWith("// block ")) {
-    const target = body.slice(9).trim();
-    if (!target.endsWith("@g.us")) {
-      await reply("❌ Usage: `// block <group_id>`");
-      return;
-    }
-    await GroupAccess.findOneAndUpdate({ chatId: target }, { $set: { status: "blocked" } }, { upsert: true });
-    allowedGroupsCache.delete(target);
-    await reply("🚫 Blocked. Bot will stay silent in that group — no further requests from it.");
-    return;
-  }
-
-  if (command === "// pending") {
-    const list = await GroupAccess.find({ status: "pending" }).lean();
-    if (!list.length) { await reply("📭 No pending group requests."); return; }
-    let text = `📋 *Pending Group Requests*\n${"─".repeat(28)}\n\n`;
-    list.forEach((g, i) => {
-      text += `${i + 1}. *${g.groupName || "Unknown"}*\n   \`${g.chatId}\`\n\n`;
-    });
-    text += "Reply with `// allow <id>` or `// block <id>`";
-    await reply(text.trim());
-    return;
-  }
-
-  if (command === "// groups") {
-    const list = await GroupAccess.find({ status: "allowed" }).lean();
-    if (!list.length) { await reply("📭 No allowed groups yet."); return; }
-    let text = `✅ *Allowed Groups (${list.length})*\n${"─".repeat(28)}\n\n`;
-    list.forEach((g, i) => { text += `${i + 1}. ${g.groupName || g.chatId}\n`; });
-    await reply(text.trim());
-    return;
-  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -770,7 +627,6 @@ async function checkAndSendReminders(sock) {
     for (const group of groups) {
       const chatId = group.chatId;
       if (!chatId.endsWith("@g.us")) continue;
-      if (!isGroupAllowed(chatId)) continue; // not approved — no auto-reminders here
 
       try {
         const groupData = await getGroupData(chatId);
@@ -1287,7 +1143,6 @@ async function checkAndAnnounceWinner(sock) {
   for (const group of groups) {
     const chatId = group.chatId;
     if (!chatId.endsWith("@g.us")) continue;
-    if (!isGroupAllowed(chatId)) continue; // not approved — no auto-announcements here
     const groupData = await getGroupData(chatId);
     const handles = getAllHandles(groupData);
     if (!handles.length) continue;
@@ -1623,7 +1478,6 @@ function startCronJobs() {
 
 async function startBot() {
   const { state, saveCreds } = await useMongoAuthState();
-  await loadAllowedGroups();
   const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
 
@@ -1647,19 +1501,6 @@ async function startBot() {
       activeSock = sock;
       console.log("✅ CF Bot is ready!");
 
-      if (OWNER_JID) {
-        try {
-          const [check] = await sock.onWhatsApp(OWNER_JID);
-          if (check?.exists) {
-            console.log(`✅ OWNER_ID verified — ${OWNER_JID} is a real WhatsApp number. DMs will be sent here.`);
-          } else {
-            console.warn(`⚠️ OWNER_ID (${OWNER_JID}) does NOT look like a valid WhatsApp number. Double-check the digits/country code in the Render env var — group-approval DMs will fail until this is fixed.`);
-          }
-        } catch (e) {
-          console.warn(`⚠️ Could not verify OWNER_ID against WhatsApp: ${e.message}`);
-        }
-      }
-
       console.log("🚀 Running immediate reminder check...");
       checkAndSendReminders(sock);
 
@@ -1682,41 +1523,12 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const chatId = msg.key.remoteJid;
-      if (!chatId) continue;
+      if (!chatId?.endsWith("@g.us")) continue;
       const body = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim();
       if (!body.startsWith("//")) continue;
       const senderId = msg.key.participant || msg.key.remoteJid;
       const command = body.toLowerCase();
       const reply = (text) => sock.sendMessage(chatId, { text }, { quoted: msg });
-
-      // ── Private DM — owner-only group-access management commands ──────────
-      if (!chatId.endsWith("@g.us")) {
-        if (OWNER_JID && normalizeJid(chatId) === normalizeJid(OWNER_JID)) {
-          try { await handleOwnerCommand(sock, command, body, reply); }
-          catch (e) { console.error("Owner command error:", e.message); }
-        }
-        continue;
-      }
-
-      // ── Group access gate ──────────────────────────────────────────────────
-      // Unapproved groups get no replies at all — just a one-time pending
-      // request sent to the owner's DM. The owner can also approve/block
-      // directly from inside the group itself with a bare `// allow` / `// block`.
-      const isOwnerSender = OWNER_JID && normalizeJid(senderId) === normalizeJid(OWNER_JID);
-      if (!isGroupAllowed(chatId)) {
-        if (isOwnerSender && command === "// allow") {
-          await GroupAccess.findOneAndUpdate({ chatId }, { $set: { status: "allowed" } }, { upsert: true });
-          allowedGroupsCache.add(chatId);
-          await reply("✅ This group is now approved. I'll reply to every command here from now on.");
-        } else if (isOwnerSender && command === "// block") {
-          await GroupAccess.findOneAndUpdate({ chatId }, { $set: { status: "blocked" } }, { upsert: true });
-          allowedGroupsCache.delete(chatId);
-        } else {
-          await handleUnapprovedGroup(sock, chatId, senderId);
-        }
-        continue;
-      }
-
       const groupData = await getGroupData(chatId);
       if (!groupData.members) groupData.members = {};
 
