@@ -160,7 +160,9 @@ const OWNER_JID = process.env.OWNER_ID
   ? (process.env.OWNER_ID.includes("@") ? process.env.OWNER_ID : `${process.env.OWNER_ID}@s.whatsapp.net`)
   : null;
 
-if (!OWNER_JID) {
+if (OWNER_JID) {
+  console.log(`👤 Owner DM target configured: ${OWNER_JID}`);
+} else {
   console.warn("⚠️ OWNER_ID env var not set — group-approval DM notifications will be skipped.");
 }
 
@@ -206,14 +208,22 @@ async function handleUnapprovedGroup(sock, chatId, senderId) {
       { upsert: true }
     );
 
+    const text =
+      `📩 *New group wants bot access*\n${"─".repeat(28)}\n\n` +
+      `Group: *${groupName}*\n` +
+      `Requested by: +${senderId.split("@")[0].split(":")[0]}\n` +
+      `ID:\n\`${chatId}\`\n\n` +
+      `Reply here:\n\`// allow ${chatId}\`\nor\n\`// block ${chatId}\``;
+
     if (OWNER_JID) {
-      const text =
-        `📩 *New group wants bot access*\n${"─".repeat(28)}\n\n` +
-        `Group: *${groupName}*\n` +
-        `Requested by: +${senderId.split("@")[0].split(":")[0]}\n` +
-        `ID:\n\`${chatId}\`\n\n` +
-        `Reply here:\n\`// allow ${chatId}\`\nor\n\`// block ${chatId}\``;
-      await sock.sendMessage(OWNER_JID, { text });
+      try {
+        await sock.sendMessage(OWNER_JID, { text });
+        console.log(`📨 Sent approval request for group "${groupName}" to owner (${OWNER_JID}).`);
+      } catch (e) {
+        console.error(`❌ Failed to DM owner about group "${groupName}" at ${OWNER_JID}:`, e.message);
+      }
+    } else {
+      console.warn(`⚠️ Group "${groupName}" is now pending but OWNER_ID isn't set, so no DM was sent. Check MongoDB's "groupaccesses" collection manually.`);
     }
   } catch (e) {
     console.error("handleUnapprovedGroup error:", e.message);
@@ -1636,6 +1646,19 @@ async function startBot() {
       latestQR = null;
       activeSock = sock;
       console.log("✅ CF Bot is ready!");
+
+      if (OWNER_JID) {
+        try {
+          const [check] = await sock.onWhatsApp(OWNER_JID);
+          if (check?.exists) {
+            console.log(`✅ OWNER_ID verified — ${OWNER_JID} is a real WhatsApp number. DMs will be sent here.`);
+          } else {
+            console.warn(`⚠️ OWNER_ID (${OWNER_JID}) does NOT look like a valid WhatsApp number. Double-check the digits/country code in the Render env var — group-approval DMs will fail until this is fixed.`);
+          }
+        } catch (e) {
+          console.warn(`⚠️ Could not verify OWNER_ID against WhatsApp: ${e.message}`);
+        }
+      }
 
       console.log("🚀 Running immediate reminder check...");
       checkAndSendReminders(sock);
