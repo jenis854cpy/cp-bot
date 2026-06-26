@@ -2080,6 +2080,80 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // yesterday ─────────────────────────────────────────────────
+        else if (command.startsWith("// yesterday ")) {
+          const url = body.slice(13).trim();
+          if (!url) {
+            await reply("❌ Usage: `// yesterday <problem_url>`\nExample: `// yesterday https://codeforces.com/contest/1790/problem/D`");
+            continue;
+          }
+          const match = url.match(/codeforces\.com\/(?:contest|problemset\/problem)\/(\d+)\/problem?\/([A-Z0-9]+)/i);
+          if (!match) {
+            await reply("❌ Invalid Codeforces problem URL.\nExamples:\n`https://codeforces.com/contest/1790/problem/D`\n`https://codeforces.com/problemset/problem/1790/D`");
+            continue;
+          }
+          const contestId = match[1];
+          const problemIndex = match[2].toUpperCase();
+          const handles = getAllHandles(groupData);
+          if (!handles.length) {
+            await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
+            continue;
+          }
+          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* yesterday...\n_Checking ${handles.length} member(s) — few seconds_`);
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const todayIST = new Date(Date.now() + IST_OFFSET_MS);
+          todayIST.setHours(0, 0, 0, 0);
+          const todayStartIST = todayIST.getTime();
+          const yesterdayStartIST = todayStartIST - 24 * 60 * 60 * 1000;
+          const solvedYesterday = [];
+          for (let i = 0; i < handles.length; i += 2) {
+            const batch = handles.slice(i, i + 2);
+            const batchResults = await Promise.all(batch.map(async (handle) => {
+              try {
+                const res = await axios.get(
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+                  { timeout: 10000 }
+                );
+                const subs = res.data.result || [];
+                let solved = false;
+                for (const s of subs) {
+                  if (s.verdict === "OK" && s.problem) {
+                    const subTimeIST = s.creationTimeSeconds * 1000 + IST_OFFSET_MS;
+                    if (subTimeIST >= yesterdayStartIST && subTimeIST < todayStartIST) {
+                      if (s.problem.contestId == contestId && s.problem.index.toUpperCase() === problemIndex) {
+                        solved = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+                return { handle, solved };
+              } catch {
+                return { handle, solved: false };
+              }
+            }));
+            for (const result of batchResults) {
+              if (result.solved) {
+                solvedYesterday.push(result.handle);
+              }
+            }
+            if (i + 2 < handles.length) await sleep(1500);
+          }
+          let text = `📊 *Problem: ${contestId}${problemIndex}*\n`;
+          text += `📅 Yesterday's Solves (IST)\n`;
+          text += `${"─".repeat(28)}\n\n`;
+          if (solvedYesterday.length === 0) {
+            text += `😴 No one solved this problem yesterday.`;
+          } else {
+            text += `✅ *Solved yesterday:*\n`;
+            solvedYesterday.forEach((h, i) => {
+              text += `  ${i + 1}. *${h}*\n`;
+            });
+          }
+          text += `\n🔗 ${url}`;
+          await reply(text.trim());
+        }
+
         // ── // streak ──────────────────────────────────────────────────
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
@@ -2195,7 +2269,7 @@ async function startBot() {
             const fresh = doc.solves.filter((s) => nowSec - s.solvedAt <= SEVEN_DAYS_SEC);
             const points = fresh.reduce((sum, s) => sum + s.points, 0);
             return { handle, points, count: fresh.length };
-          }).sort((a, b) => b.points - a.points || b.count - a.count);
+          }).sort((a, b) => b.points - a.points || a.count - b.count);
 
           const active = results.filter((r) => r.points > 0);
 
@@ -2206,7 +2280,7 @@ async function startBot() {
           } else {
             active.forEach((r, i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-              text += `${medal} *${r.handle}* — ${r.points} pts, ${r.count} Q\n`;
+              text += `${medal} *${r.handle}* — ${r.points} pts (${r.count} Q)\n`;
             });
           }
 
@@ -2285,6 +2359,7 @@ async function startBot() {
             `🏷 *[ 04 ]  DAILY TRACKING*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `✅ \`// today <url>\`\n   _Who solved a problem today (IST)_\n\n` +
+            `✅ \`// yesterday <url>\`\n   _Who solved a problem yesterday (IST)_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 05 ]  HELP*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
