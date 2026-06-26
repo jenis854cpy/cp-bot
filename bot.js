@@ -2037,7 +2037,7 @@ async function startBot() {
             const batchResults = await Promise.all(batch.map(async (handle) => {
               try {
                 const res = await axios.get(
-                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=20`,
                   { timeout: 10000 }
                 );
                 const subs = res.data.result || [];
@@ -2111,7 +2111,7 @@ async function startBot() {
             const batchResults = await Promise.all(batch.map(async (handle) => {
               try {
                 const res = await axios.get(
-                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=100`,
+                  `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=40`,
                   { timeout: 10000 }
                 );
                 const subs = res.data.result || [];
