@@ -1296,62 +1296,74 @@ async function checkAndAnnounceWinner(sock) {
     if (!handles.length) continue;
 
     try {
-      const lastContest = await getRecentFinishedContest();
-      if (!lastContest) continue;
-      const lastId = lastContest.id;
+      const recentContests = await getRecentFinishedContests();
+      if (!recentContests.length) continue;
 
-      if (groupData.lastContestAnnounced !== lastId) {
-        const finishedAt = lastContest.startTimeSeconds + lastContest.durationSeconds;
-        const now = Math.floor(Date.now() / 1000);
-        if (now - finishedAt <= 7200) {
-          const standingsResult = await getContestStandings(lastId, handles);
-          if (standingsResult.success) {
-            const results = standingsResult.results || [];
-            const entries = results.filter(r => r.solved > 0).sort(compareContestEntries);
-            if (entries.length) {
-              const [winner] = entries;
-              let text = `🏁 *Contest Over!*\n📋 *${lastContest.name}*\n${"─".repeat(28)}\n\n`;
-              text += `🏆 *Group Winner: ${winner.handle}* with *${winner.solved}* solved${winner.rank ? ` (Rank #${winner.rank})` : ''}!\n\n📊 *Group Performance:*\n`;
-              entries.forEach((r, i) => {
-                const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
-                const rankStr = r.rank ? ` | Rank #${r.rank}` : ' | N/A';
-                text += `${medal} *${r.handle}* — ✅ ${r.solved} solved${rankStr}\n`;
-              });
-              await sock.sendMessage(chatId, { text });
-            }
+      // Build a combined key like "2240_2241" for paired rounds, or just "2240"
+      const contestIds = recentContests.map(c => c.id).sort((a, b) => a - b);
+      const combinedKey = contestIds.join('_');
+      const now = Math.floor(Date.now() / 1000);
+
+      // ── Winner announcement (once per combined key) ──────────────────────
+      if (String(groupData.lastContestAnnounced) !== combinedKey) {
+        for (const contest of recentContests) {
+          const finishedAt = contest.startTimeSeconds + contest.durationSeconds;
+          if (now - finishedAt > 7200) continue;
+          const standingsResult = await getContestStandings(contest.id, handles);
+          if (!standingsResult.success) continue;
+          const entries = (standingsResult.results || [])
+            .filter(r => r.solved > 0)
+            .sort(compareContestEntries);
+          if (!entries.length) continue;
+          const [winner] = entries;
+          let text = `🏁 *Contest Over!*\n📋 *${contest.name}*\n${"─".repeat(28)}\n\n`;
+          text += `🏆 *Group Winner: ${winner.handle}* with *${winner.solved}* solved!\n\n📊 *Group Performance:*\n`;
+          entries.forEach((r, i) => {
+            const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `  ${i + 1}.`;
+            text += `${medal} *${r.handle}* — ✅ ${r.solved} solved\n`;
+          });
+          text += `\n🔗 https://codeforces.com/contest/${contest.id}`;
+          await sock.sendMessage(chatId, { text });
+        }
+        await saveGroupData(chatId, { ...groupData, lastContestAnnounced: combinedKey });
+      }
+
+      // ── Rating / promotion announcement ──────────────────────────────────
+      if (String(groupData.lastRatingAnnounced) === combinedKey) continue;
+
+      // Use the latest-ending contest to check if enough time has passed
+      const latestEnd = Math.max(...recentContests.map(c => c.startTimeSeconds + c.durationSeconds));
+      if (now - latestEnd < 1800) {
+        console.log(`⏳ Waiting for rating changes for contests ${combinedKey}`);
+        continue;
+      }
+
+      // Gather promotions across all contests in the pair
+      let allReady = true;
+      const allPromoted = [];
+      for (const contest of recentContests) {
+        const { ready, promoted } = await getContestPromotions(contest.id, handles);
+        if (!ready) {
+          if (now - latestEnd < 3 * 3600) {
+            allReady = false;
+            break;
+          }
+          // 3h+ elapsed — treat as unrated for this contest, continue with others
+        } else {
+          for (const p of promoted) {
+            if (!allPromoted.find(x => x.handle === p.handle)) allPromoted.push(p);
           }
         }
-        await saveGroupData(chatId, { ...groupData, lastContestAnnounced: lastId });
       }
 
-      if (groupData.lastRatingAnnounced === lastId) continue;
-
-      const endTime = lastContest.startTimeSeconds + lastContest.durationSeconds;
-      const now = Math.floor(Date.now() / 1000);
-      if (now - endTime < 1800) {
-        console.log(`⏳ Waiting for rating changes for contest ${lastId}`);
+      if (!allReady) {
+        console.log(`⏳ Ratings not published yet for ${combinedKey}, will retry`);
         continue;
       }
 
-      const { ready, promoted } = await getContestPromotions(lastId, handles);
-
-      if (!ready) {
-        // Big Div2/3/4 rounds can take well over 30 min for CF to finish
-        // computing ratings, so keep retrying for up to 3 hours. After that,
-        // assume it's a genuinely unrated contest and stop checking it
-        // (otherwise this would retry every 5 min forever).
-        if (now - endTime < 3 * 3600) {
-          console.log(`⏳ Ratings not published yet for contest ${lastId}, will retry`);
-          continue;
-        }
-        console.log(`ℹ️ No rating changes 3h+ after contest ${lastId} — assuming unrated, won't retry further`);
-        await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
-        continue;
-      }
-
-      if (promoted.length) {
+      if (allPromoted.length) {
         let msg = `🎉 *Promotion Alerts!* 🎉\n\n`;
-        for (const p of promoted) {
+        for (const p of allPromoted) {
           msg += `@${p.handle} — Congratulations! Promoted from *${p.oldRank}* to *${p.newRank}*! 🚀\n`;
           msg += `📊 Rating: ${p.oldRating} → ${p.newRating} (${p.delta >= 0 ? '+' : ''}${p.delta})\n`;
           msg += `🏅 New Rank: ${p.newRank}\n\n`;
@@ -1363,13 +1375,14 @@ async function checkAndAnnounceWinner(sock) {
           console.error(`Failed to send promotion message to ${chatId}:`, e.message);
         }
       } else {
-        const msg = `📊 Rating changes processed for ${lastContest.name}.\n😴 No rank promotions this time. Keep practicing! 💪`;
+        const names = recentContests.map(c => c.name).join(' & ');
+        const msg = `📊 Rating changes processed for ${names}.\n😴 No rank promotions this time. Keep practicing! 💪`;
         try {
           await sock.sendMessage(chatId, { text: msg });
         } catch (e) {}
       }
 
-      await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: lastId });
+      await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: combinedKey });
 
     } catch (e) {
       console.error(`Winner/Promotion check error for ${chatId}:`, e.message);
@@ -1378,11 +1391,30 @@ async function checkAndAnnounceWinner(sock) {
 }
 
 async function getRecentFinishedContest() {
+  const contests = await getRecentFinishedContests();
+  return contests.length ? contests[0] : null;
+}
+
+async function getRecentFinishedContests() {
   try {
     const list = await getCFContestList();
-    const finished = list.filter((c) => c.phase === "FINISHED");
-    return finished.length ? finished[0] : null;
-  } catch { return null; }
+    const finished = list
+      .filter(c => c.phase === 'FINISHED')
+      .sort((a, b) => (b.startTimeSeconds + b.durationSeconds) - (a.startTimeSeconds + a.durationSeconds));
+    if (!finished.length) return [];
+    const latest = finished[0];
+    const second = finished[1];
+    if (second) {
+      const endDiff = Math.abs(
+        (latest.startTimeSeconds + latest.durationSeconds) -
+        (second.startTimeSeconds + second.durationSeconds)
+      );
+      const stripDiv = name => name.replace(/s*Div.s*d+/i, '').replace(/s*(Div.s*d+)/i, '').trim();
+      const sameSeries = stripDiv(latest.name) === stripDiv(second.name);
+      if (sameSeries && endDiff < 1800) return [latest, second];
+    }
+    return [latest];
+  } catch { return []; }
 }
 
 // ─── Promotions (rank-up) Helper ──────────────────────────────────────────────
@@ -1869,56 +1901,59 @@ async function startBot() {
             continue;
           }
 
-          let contest = null;
+          let solvedContests = [];
           let isLive = false;
           try {
             const list = await getCFContestList();
             const sorted = list.sort((a, b) => b.startTimeSeconds - a.startTimeSeconds);
             const running = sorted.find(c => c.phase === "CODING");
             if (running) {
-              contest = running;
+              const stripDiv = name => name.replace(/\s*Div\.\s*\d+/i, '').replace(/\s*\(Div\.\s*\d+\)/i, '').trim();
+              const paired = sorted.filter(c =>
+                c.phase === "CODING" &&
+                stripDiv(c.name) === stripDiv(running.name)
+              );
+              solvedContests = paired.length > 1 ? paired : [running];
               isLive = true;
             } else {
-              const finished = sorted.find(c => c.phase === "FINISHED");
-              if (finished) contest = finished;
+              solvedContests = await getRecentFinishedContests();
             }
           } catch (e) {
             console.error("Error fetching contest list:", e.message);
           }
 
-          if (!contest) {
+          if (!solvedContests.length) {
             await reply(`⚠️ Could not detect the latest contest automatically.\nPlease use \`// contest <id>\` manually.`);
             continue;
           }
 
-          await reply(`⏳ Fetching standings for *${contest.name}*...`);
+          for (const contest of solvedContests) {
+            await reply(`⏳ Fetching standings for *${contest.name}*...`);
 
-          const result = await getContestStandings(contest.id, handles);
-          if (!result.success) {
-            await reply(`❌ Failed to fetch standings: ${result.error}`);
-            continue;
-          }
-
-          const isLiveContest = result.phase === 'CODING';
-          const output = formatContestStandings(result.results, result.totalProblems, isLiveContest, contest);
-
-          let promoText = "";
-          if (!isLiveContest) {
-            // Contest is over — check if any of our members ranked up
-            // (e.g. Pupil → Specialist) because of this contest.
-            const { ready, promoted } = await getContestPromotions(contest.id, handles);
-            if (ready && promoted.length) {
-              promoText += `\n\n🎉 *Rank-Ups!*\n${"─".repeat(28)}\n`;
-              for (const p of promoted) {
-                promoText += `${rankEmoji(p.newRank)} *${p.handle}*: ${p.oldRank} → *${p.newRank}* (${p.oldRating}→${p.newRating}, ${p.delta >= 0 ? '+' : ''}${p.delta}) 🚀\n`;
-              }
-            } else if (!ready) {
-              promoText += `\n\n⏳ _Ratings not finalized by Codeforces yet — rank-ups, if any, will show once they're published._`;
+            const result = await getContestStandings(contest.id, handles);
+            if (!result.success) {
+              await reply(`❌ Failed to fetch standings for *${contest.name}*: ${result.error}`);
+              continue;
             }
-          }
 
-          // Append contest link
-          await reply(output + promoText + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
+            const isLiveContest = result.phase === 'CODING';
+            const output = formatContestStandings(result.results, result.totalProblems, isLiveContest, contest);
+
+            let promoText = "";
+            if (!isLiveContest) {
+              const { ready, promoted } = await getContestPromotions(contest.id, handles);
+              if (ready && promoted.length) {
+                promoText += `\n\n🎉 *Rank-Ups!*\n${"─".repeat(28)}\n`;
+                for (const p of promoted) {
+                  promoText += `${rankEmoji(p.newRank)} *${p.handle}*: ${p.oldRank} → *${p.newRank}* (${p.oldRating}→${p.newRating}, ${p.delta >= 0 ? '+' : ''}${p.delta}) 🚀\n`;
+                }
+              } else if (!ready) {
+                promoText += `\n\n⏳ _Ratings not finalized by Codeforces yet — rank-ups, if any, will show once they're published._`;
+              }
+            }
+
+            await reply(output + promoText + `\n\n🔗 https://codeforces.com/contest/${contest.id}`);
+          }
         }
 
         // ── // suggest ─────────────────────────────────────────────────────
