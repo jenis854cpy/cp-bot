@@ -39,8 +39,8 @@ const CFData = mongoose.model("CFData",
   new mongoose.Schema({
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
-    lastContestAnnounced: { type: Number, default: 0 },
-    lastRatingAnnounced: { type: Number, default: 0 },
+    lastContestAnnounced: { type: String, default: "0" },
+    lastRatingAnnounced: { type: String, default: "0" },
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
