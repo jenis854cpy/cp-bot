@@ -2362,6 +2362,97 @@ async function startBot() {
           await reply(text.trim());
         }
 
+        // ── // resources ─────────────────────────────────────────────────
+        else if (command === "// resources" || command.startsWith("// resources ")) {
+          const RESOURCES_QA = [
+            {
+              q: "How do I start Competitive Programming (CP)?",
+              a: "Start with C++ (fast I/O, STL). Learn basic syntax, arrays, loops, functions. Then solve easy Codeforces problems (Div. 4 / Div. 3, rating 800–1200). Consistency beats everything — solve at least 1 problem daily. Don't skip problems; read editorials after a genuine attempt."
+            },
+            {
+              q: "How do I start Data Structures and Algorithms (DSA)?",
+              a: "Begin with arrays, strings, recursion, then move to linked lists, stacks, queues, trees, graphs, and dynamic programming. Follow a structured course or playlist (see Q3). Practice each topic on LeetCode or GFG immediately after learning."
+            },
+            {
+              q: "Which is the best playlist for DSA?",
+              a: "🎬 Top picks:\n• *Striver's A2Z DSA* (YouTube) — most complete, structured\n• *Abdul Bari* — best for algorithm concepts and intuition\n• *Aditya Verma* — best for DP and recursion\n• *Luv's CP Sheet* — for competitive programming specifically"
+            },
+            {
+              q: "Which is the best book for CP?",
+              a: "📚 Top picks:\n• *Competitive Programmer's Handbook* by Antti Laaksonen — free PDF, covers most CP topics\n• *CP3 (Competitive Programming 3)* by Steven Halim — great for ICPC level\n• *Introduction to Algorithms (CLRS)* — if you want deep theoretical understanding"
+            },
+            {
+              q: "Where should I solve practice questions?",
+              a: "🖥 Best platforms:\n• *Codeforces* — best for CP, rated contests, huge problem archive\n• *LeetCode* — best for DSA & interviews\n• *AtCoder* — excellent problem quality, great for beginners to advanced\n• *CSES Problem Set* — must-do structured CP problem set\n• *GeeksforGeeks* — good for DSA theory + practice"
+            },
+            {
+              q: "Which topics do I need to know for campus placements?",
+              a: "📋 Must-know for placements:\n• Arrays, Strings, Hashing\n• Linked Lists, Stacks, Queues\n• Trees (BST, traversals)\n• Graphs (BFS, DFS, shortest path)\n• Dynamic Programming (basic to medium)\n• Sorting & Searching\n• Recursion & Backtracking\n• OOPs concepts (for CS roles)"
+            },
+            {
+              q: "Which topics are generally asked in technical interviews?",
+              a: "💼 Most frequent interview topics:\n• Arrays / Two Pointers / Sliding Window\n• Binary Search\n• Trees & Graphs (BFS/DFS)\n• Dynamic Programming\n• Recursion & Backtracking\n• Hashmaps & Sets\n• System Design (for SDE-2+ roles)\nFocus on LeetCode Medium problems — that's the sweet spot."
+            },
+            {
+              q: "Which is the best DSA question sheet?",
+              a: "📝 Top sheets:\n• *Striver's SDE Sheet* — 191 must-do problems, most popular for placements\n• *Blind 75* — 75 curated LeetCode problems, great for FAANG prep\n• *NeetCode 150* — improved version of Blind 75 with video solutions\n• *Love Babbar's 450 DSA Sheet* — comprehensive, good for beginners"
+            },
+            {
+              q: "Which is the best DSA book?",
+              a: "📖 Top DSA books:\n• *Data Structures & Algorithms in Python/Java* by Goodrich — academic and thorough\n• *Cracking the Coding Interview* by Gayle McDowell — best for interview prep\n• *CLRS (Introduction to Algorithms)* — gold standard, theory-heavy\n• *The Algorithm Design Manual* by Skiena — great intuition-building"
+            },
+            {
+              q: "Which is the best AI tool for learning new topics and debugging code?",
+              a: "🤖 Top AI tools:\n• *Claude (Anthropic)* — best for deep explanations, debugging, and understanding concepts\n• *ChatGPT* — good all-rounder for coding help\n• *GitHub Copilot* — best for in-editor code suggestions\n• *Phind* — search engine built for developers\nFor CP specifically, use AI to understand editorial logic, not to get direct answers."
+            },
+            {
+              q: "Where can I learn advanced and hard topics?",
+              a: "🚀 For advanced CP topics:\n• *CP-Algorithms (cp-algorithms.com)* — best reference for advanced algorithms\n• *Codeforces Blogs* — community tutorials on niche topics\n• *USACO Guide* — structured roadmap from beginner to Platinum\n• *AtCoder Educational DP Contest* — 26 DP problems covering all DP types\n• *Errichto & tourist* on YouTube — high-level CP thinking"
+            },
+            {
+              q: "How do I master DSA?",
+              a: "🏆 The honest path to mastery:\n1. Learn a topic → immediately solve 5–10 problems on it\n2. Upsolve every contest problem you couldn't solve\n3. Read editorials to learn *how* to think, not just the solution\n4. Track your progress — revisit weak topics monthly\n5. Stay consistent — 6 months of daily practice beats 2 months of cramming\nThere's no shortcut. Volume + reflection = mastery."
+            }
+          ];
+
+          const arg = body.slice(13).trim();
+
+          if (!arg) {
+            // Show list of all 12 questions
+            let text = `📚 *CP & DSA Resources*
+${"─".repeat(28)}
+
+`;
+            text += `_Type_ \`// resources <number>\` _for the answer_
+
+`;
+            RESOURCES_QA.forEach((item, i) => {
+              text += `*${i + 1}.* ${item.q}
+`;
+            });
+            text += `
+${"─".repeat(28)}
+_eg. \`// resources 3\` for DSA playlist_`;
+            await reply(text.trim());
+            continue;
+          }
+
+          const num = parseInt(arg);
+          if (isNaN(num) || num < 1 || num > RESOURCES_QA.length) {
+            await reply(`❌ Please enter a number between 1 and ${RESOURCES_QA.length}.
+Example: \`// resources 5\``);
+            continue;
+          }
+
+          const item = RESOURCES_QA[num - 1];
+          let text = `📚 *Q${num}: ${item.q}*
+${"─".repeat(28)}
+
+`;
+          text += `${item.a}`;
+          await reply(text.trim());
+        }
+
         // ── // help ──────────────────────────────────────────────────────
         else if (command === "// help") {
           await reply(
@@ -2398,6 +2489,7 @@ async function startBot() {
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 05 ]  HELP*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
+            `📚 \`// resources\`\n   _CP & DSA learning resources_\n\n` +
             `📖 \`// help\`\n   _Show this menu anytime_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `✦ *AUTO FEATURES*\n` +
