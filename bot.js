@@ -968,6 +968,13 @@ function setCache(key, data, phase) {
 }
 
 // ─── Batched validation ──────────────────────────────────────────────────────
+// IMPORTANT: Codeforces' user.info?handles=a;b;c... call fails the ENTIRE
+// request (status != "OK") if even ONE handle in the list is invalid/typo'd/
+// deleted — it does not return partial results for the good handles. So if a
+// batch call fails, we must NOT discard the whole batch as invalid (that used
+// to wipe out up to 50 legitimate members at once in bigger groups). Instead,
+// fall back to checking that batch's handles one-by-one to isolate just the
+// actual bad handle(s).
 async function validateHandlesBatched(handles, batchSize = 50) {
   console.log(`🔍 Validating ${handles.length} handles in batches of ${batchSize}`);
   const valid = [];
@@ -987,16 +994,46 @@ async function validateHandlesBatched(handles, batchSize = 50) {
         const missing = batch.filter(h => !found.includes(h));
         invalid.push(...missing);
       } else {
-        invalid.push(...batch);
+        console.warn(`⚠️ Batch of ${batch.length} failed as a whole (likely one bad handle) — falling back to per-handle check`);
+        const { valid: subValid, invalid: subInvalid } = await validateHandlesIndividually(batch);
+        valid.push(...subValid);
+        invalid.push(...subInvalid);
       }
     } catch (e) {
-      console.warn(`Batch validation failed: ${e.message}`);
-      invalid.push(...batch);
+      console.warn(`Batch validation request failed: ${e.message} — falling back to per-handle check`);
+      const { valid: subValid, invalid: subInvalid } = await validateHandlesIndividually(batch);
+      valid.push(...subValid);
+      invalid.push(...subInvalid);
     }
     await sleep(200);
   }
 
   console.log(`✅ Valid: ${valid.length}, Invalid: ${invalid.length}`);
+  return { valid, invalid };
+}
+
+// Fallback used only when a batched user.info call fails outright. Checks
+// each handle individually so a single bad handle can't take down everyone
+// else's standings/winner detection.
+async function validateHandlesIndividually(batch) {
+  const valid = [];
+  const invalid = [];
+  for (const handle of batch) {
+    try {
+      const res = await axios.get(
+        `https://codeforces.com/api/user.info?handles=${handle}`,
+        { timeout: 8000 }
+      );
+      if (res.data.status === 'OK' && res.data.result?.length) {
+        valid.push(res.data.result[0].handle);
+      } else {
+        invalid.push(handle);
+      }
+    } catch (e) {
+      invalid.push(handle);
+    }
+    await sleep(150);
+  }
   return { valid, invalid };
 }
 
@@ -1338,17 +1375,29 @@ async function checkAndAnnounceWinner(sock) {
         continue;
       }
 
-      // Gather promotions across all contests in the pair
+      // Gather promotions across all contests in the pair.
+      // NOTE: Div2/Div3/Educational rounds routinely take Codeforces several
+      // hours (sometimes close to 12h) to publish rating changes after the
+      // contest ends. We keep retrying (this function re-runs every 5 min)
+      // instead of guessing "no promotions" early — that used to fire a
+      // false "no rank promotions" message and permanently mark the contest
+      // as announced, so the real promotion alert never got sent once
+      // ratings actually landed. We only give up (and treat it as an
+      // effectively-unrated contest) after a generous 20h window, to avoid
+      // polling forever on a contest that is genuinely unrated.
+      const RATING_WAIT_GIVEUP_SECONDS = 20 * 3600;
       let allReady = true;
       const allPromoted = [];
       for (const contest of recentContests) {
         const { ready, promoted } = await getContestPromotions(contest.id, handles);
         if (!ready) {
-          if (now - latestEnd < 3 * 3600) {
+          if (now - latestEnd < RATING_WAIT_GIVEUP_SECONDS) {
             allReady = false;
             break;
           }
-          // 3h+ elapsed — treat as unrated for this contest, continue with others
+          // 20h+ elapsed with still no data — almost certainly genuinely
+          // unrated (or CF will never publish it); stop waiting on this one
+          // contest specifically and continue with the others.
         } else {
           for (const p of promoted) {
             if (!allPromoted.find(x => x.handle === p.handle)) allPromoted.push(p);
@@ -1357,7 +1406,7 @@ async function checkAndAnnounceWinner(sock) {
       }
 
       if (!allReady) {
-        console.log(`⏳ Ratings not published yet for ${combinedKey}, will retry`);
+        console.log(`⏳ Ratings not published yet for ${combinedKey}, will retry in 5 min`);
         continue;
       }
 
