@@ -39,8 +39,9 @@ const CFData = mongoose.model("CFData",
   new mongoose.Schema({
     chatId: { type: String, required: true, unique: true },
     members: { type: mongoose.Schema.Types.Mixed, default: {} },
-    lastContestAnnounced: { type: String, default: "0" },
-    lastRatingAnnounced: { type: String, default: "0" },
+    lastContestAnnounced: { type: String, default: "0" }, // legacy, no longer written to — kept so old docs don't break
+    lastRatingAnnounced: { type: String, default: "0" },  // legacy, no longer written to — kept so old docs don't break
+    announcedContestKeys: { type: [String], default: [] }, // every contest/pair-cluster ID already announced — never re-announced, never skipped forever
     reminders: { type: mongoose.Schema.Types.Mixed, default: {} },
   }));
 
@@ -125,11 +126,12 @@ async function useMongoAuthState() {
 // ─── Group Data ────────────────────────────────────────────────────────────────
 async function getGroupData(chatId) {
   const group = await CFData.findOne({ chatId }).lean();
-  if (!group) return { members: {}, lastContestAnnounced: 0, lastRatingAnnounced: 0, reminders: {} };
+  if (!group) return { members: {}, lastContestAnnounced: 0, lastRatingAnnounced: 0, announcedContestKeys: [], reminders: {} };
   return {
     members: group.members || {},
     lastContestAnnounced: group.lastContestAnnounced || 0,
     lastRatingAnnounced: group.lastRatingAnnounced || 0,
+    announcedContestKeys: group.announcedContestKeys || [],
     reminders: group.reminders || {},
   };
 }
@@ -140,6 +142,7 @@ async function saveGroupData(chatId, groupData) {
       members: groupData.members,
       lastContestAnnounced: groupData.lastContestAnnounced,
       lastRatingAnnounced: groupData.lastRatingAnnounced || 0,
+      announcedContestKeys: groupData.announcedContestKeys || [],
       reminders: groupData.reminders || {},
     }},
     { upsert: true });
@@ -1323,6 +1326,14 @@ function formatContestStandings(results, totalProblems, isLive, contestInfo) {
 }
 
 // ─── Winner Announcement ──────────────────────────────────────────────────────
+// Looks back over a window (not just "the latest contest") so nothing is
+// permanently skipped if the bot was asleep across more than one contest,
+// and only marks a contest/cluster as announced once a message for it has
+// actually SUCCEEDED — a failed CF fetch or a stale/expired window no longer
+// gets silently marked "done".
+const WINNER_LOOKBACK_HOURS = 48;   // how far back to look for un-announced contests
+const WINNER_GIVEUP_HOURS = 48;     // stop retrying a contest whose standings never load
+
 async function checkAndAnnounceWinner(sock) {
   const groups = await CFData.find({}).lean();
   for (const group of groups) {
@@ -1334,25 +1345,31 @@ async function checkAndAnnounceWinner(sock) {
     if (!handles.length) continue;
 
     try {
-      const recentContests = await getRecentFinishedContests();
-      if (!recentContests.length) continue;
+      const finished = await getFinishedContestsSince(WINNER_LOOKBACK_HOURS);
+      if (!finished.length) continue;
 
-      // Build a combined key like "2240_2241" for paired rounds, or just "2240"
-      const contestIds = recentContests.map(c => c.id).sort((a, b) => a - b);
-      const combinedKey = contestIds.join('_');
+      const clusters = clusterContestsForAnnouncement(finished);
+      const announced = new Set((groupData.announcedContestKeys || []).map(String));
       const now = Math.floor(Date.now() / 1000);
+      let changed = false;
 
-      // ── Winner announcement (once per combined key) ──────────────────────
-      if (String(groupData.lastContestAnnounced) !== combinedKey) {
-        for (const contest of recentContests) {
-          const finishedAt = contest.startTimeSeconds + contest.durationSeconds;
-          if (now - finishedAt > 7200) continue;
+      for (const cluster of clusters) {
+        const key = cluster.map(c => c.id).sort((a, b) => a - b).join('_');
+        if (announced.has(key)) continue; // already sent for this exact contest/pair
+
+        const latestEnd = Math.max(...cluster.map(c => c.startTimeSeconds + c.durationSeconds));
+        const hoursSinceEnd = (now - latestEnd) / 3600;
+        let anyFetchFailed = false;
+
+        for (const contest of cluster) {
           const standingsResult = await getContestStandings(contest.id, handles);
-          if (!standingsResult.success) continue;
+          if (!standingsResult.success) { anyFetchFailed = true; continue; }
+
           const entries = (standingsResult.results || [])
             .filter(r => r.solved > 0)
             .sort(compareContestEntries);
-          if (!entries.length) continue;
+          if (!entries.length) continue; // nobody in the group solved anything — nothing to announce for this contest
+
           const [winner] = entries;
           let text = `🏁 *Contest Over!*\n📋 *${contest.name}*\n${"─".repeat(28)}\n\n`;
           text += `🏆 *Group Winner: ${winner.handle}* with *${winner.solved}* solved!\n\n📊 *Group Performance:*\n`;
@@ -1361,9 +1378,27 @@ async function checkAndAnnounceWinner(sock) {
             text += `${medal} *${r.handle}* — ✅ ${r.solved} solved\n`;
           });
           text += `\n🔗 https://codeforces.com/contest/${contest.id}`;
-          await sock.sendMessage(chatId, { text });
+          try {
+            await sock.sendMessage(chatId, { text });
+          } catch (e) {
+            anyFetchFailed = true; // send failed too — retry this cluster next sweep rather than losing it
+            console.error(`Failed to send winner message to ${chatId}:`, e.message);
+          }
         }
-        await saveGroupData(chatId, { ...groupData, lastContestAnnounced: combinedKey });
+
+        if (anyFetchFailed && hoursSinceEnd < WINNER_GIVEUP_HOURS) {
+          // Don't mark as announced — try again on the next 5-min sweep.
+          continue;
+        }
+
+        // Either everything worked, or it's been unrecoverable for 48h+ and
+        // we're giving up on this specific contest so it doesn't retry forever.
+        announced.add(key);
+        changed = true;
+      }
+
+      if (changed) {
+        await saveGroupData(chatId, { ...groupData, announcedContestKeys: Array.from(announced) });
       }
 
       // NOTE: rating/promotion announcements no longer happen here. That used
@@ -1375,7 +1410,7 @@ async function checkAndAnnounceWinner(sock) {
       // nothing can be permanently missed and nothing can double-send.
 
     } catch (e) {
-      console.error(`Winner/Promotion check error for ${chatId}:`, e.message);
+      console.error(`Winner check error for ${chatId}:`, e.message);
     }
   }
 }
@@ -1405,6 +1440,60 @@ async function getRecentFinishedContests() {
     }
     return [latest];
   } catch { return []; }
+}
+
+// ─── Lookback-window contest fetch + clustering (used by the auto winner
+// announcer only — getRecentFinishedContest[s]() above stays as-is for the
+// on-demand `// solved` command, which only ever wants "the latest one").
+//
+// Returns every FINISHED contest that ended within the last `lookbackHours`,
+// oldest-first, so the announcer can catch up on more than one missed
+// contest instead of only ever seeing the newest.
+async function getFinishedContestsSince(lookbackHours) {
+  try {
+    const list = await getCFContestList();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cutoff = nowSec - lookbackHours * 3600;
+    return list
+      .filter(c => c.phase === 'FINISHED' && (c.startTimeSeconds + c.durationSeconds) >= cutoff)
+      .sort((a, b) => (a.startTimeSeconds + a.durationSeconds) - (b.startTimeSeconds + b.durationSeconds));
+  } catch { return []; }
+}
+
+// Groups a flat list of finished contests into announcement clusters —
+// same-series Div1/Div2/Div3 rounds that ended within 30 min of each other
+// become one cluster (one combined message), everything else is its own
+// singleton cluster. Applied across the WHOLE lookback window, not just the
+// newest contest, so multiple missed rounds each still get clustered
+// correctly instead of only the latest one ever being considered.
+function clusterContestsForAnnouncement(finished) {
+  const stripDiv = name => name
+    .replace(/\s*\(Div\.?\s*\d+\)/i, '')
+    .replace(/\s*Div\.?\s*\d+/i, '')
+    .trim();
+  const used = new Set();
+  const clusters = [];
+  for (let i = 0; i < finished.length; i++) {
+    if (used.has(finished[i].id)) continue;
+    const a = finished[i];
+    let partner = null;
+    for (let j = i + 1; j < finished.length; j++) {
+      if (used.has(finished[j].id)) continue;
+      const b = finished[j];
+      const endDiff = Math.abs(
+        (a.startTimeSeconds + a.durationSeconds) - (b.startTimeSeconds + b.durationSeconds)
+      );
+      if (stripDiv(a.name) === stripDiv(b.name) && endDiff < 1800) { partner = b; break; }
+    }
+    if (partner) {
+      used.add(a.id); used.add(partner.id);
+      clusters.push([a, partner]);
+    } else {
+      used.add(a.id);
+      clusters.push([a]);
+    }
+  }
+  return clusters;
 }
 
 // ─── Promotions (rank-up) Helper ──────────────────────────────────────────────
