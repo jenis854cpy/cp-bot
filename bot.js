@@ -76,6 +76,7 @@ const SolveHistory = mongoose.model("SolveHistory",
     },
     totalSolved: { type: Number, default: 0 }, // lifetime counter — never decrements
     lastSynced: { type: Date, default: null },
+    rating: { type: Number, default: null }, // last KNOWN current CF rating — null = never synced yet (baseline not established)
   }));
 
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
@@ -1365,73 +1366,13 @@ async function checkAndAnnounceWinner(sock) {
         await saveGroupData(chatId, { ...groupData, lastContestAnnounced: combinedKey });
       }
 
-      // ── Rating / promotion announcement ──────────────────────────────────
-      if (String(groupData.lastRatingAnnounced) === combinedKey) continue;
-
-      // Use the latest-ending contest to check if enough time has passed
-      const latestEnd = Math.max(...recentContests.map(c => c.startTimeSeconds + c.durationSeconds));
-      if (now - latestEnd < 1800) {
-        console.log(`⏳ Waiting for rating changes for contests ${combinedKey}`);
-        continue;
-      }
-
-      // Gather promotions across all contests in the pair.
-      // NOTE: Div2/Div3/Educational rounds routinely take Codeforces several
-      // hours (sometimes close to 12h) to publish rating changes after the
-      // contest ends. We keep retrying (this function re-runs every 5 min)
-      // instead of guessing "no promotions" early — that used to fire a
-      // false "no rank promotions" message and permanently mark the contest
-      // as announced, so the real promotion alert never got sent once
-      // ratings actually landed. We only give up (and treat it as an
-      // effectively-unrated contest) after a generous 20h window, to avoid
-      // polling forever on a contest that is genuinely unrated.
-      const RATING_WAIT_GIVEUP_SECONDS = 20 * 3600;
-      let allReady = true;
-      const allPromoted = [];
-      for (const contest of recentContests) {
-        const { ready, promoted } = await getContestPromotions(contest.id, handles);
-        if (!ready) {
-          if (now - latestEnd < RATING_WAIT_GIVEUP_SECONDS) {
-            allReady = false;
-            break;
-          }
-          // 20h+ elapsed with still no data — almost certainly genuinely
-          // unrated (or CF will never publish it); stop waiting on this one
-          // contest specifically and continue with the others.
-        } else {
-          for (const p of promoted) {
-            if (!allPromoted.find(x => x.handle === p.handle)) allPromoted.push(p);
-          }
-        }
-      }
-
-      if (!allReady) {
-        console.log(`⏳ Ratings not published yet for ${combinedKey}, will retry in 5 min`);
-        continue;
-      }
-
-      if (allPromoted.length) {
-        let msg = `🎉 *Promotion Alerts!* 🎉\n\n`;
-        for (const p of allPromoted) {
-          msg += `@${p.handle} — Congratulations! Promoted from *${p.oldRank}* to *${p.newRank}*! 🚀\n`;
-          msg += `📊 Rating: ${p.oldRating} → ${p.newRating} (${p.delta >= 0 ? '+' : ''}${p.delta})\n`;
-          msg += `🏅 New Rank: ${p.newRank}\n\n`;
-        }
-        msg += `🔥 Keep up the great work! 💪`;
-        try {
-          await sock.sendMessage(chatId, { text: msg });
-        } catch (e) {
-          console.error(`Failed to send promotion message to ${chatId}:`, e.message);
-        }
-      } else {
-        const names = recentContests.map(c => c.name).join(' & ');
-        const msg = `📊 Rating changes processed for ${names}.\n😴 No rank promotions this time. Keep practicing! 💪`;
-        try {
-          await sock.sendMessage(chatId, { text: msg });
-        } catch (e) {}
-      }
-
-      await saveGroupData(chatId, { ...groupData, lastRatingAnnounced: combinedKey });
+      // NOTE: rating/promotion announcements no longer happen here. That used
+      // to poll contest.ratingChanges for the single most-recent contest and
+      // wait up to 20h for CF to publish it — which meant any contest missed
+      // during downtime was skipped forever. It's now handled by
+      // checkRatingChangesAndAnnounce(), which polls each handle's CURRENT
+      // rating every ~10-12 min and diffs against the last stored value, so
+      // nothing can be permanently missed and nothing can double-send.
 
     } catch (e) {
       console.error(`Winner/Promotion check error for ${chatId}:`, e.message);
@@ -1507,6 +1448,115 @@ async function getContestPromotions(contestId, handles) {
     // ratings haven't been processed yet — treat that the same as "not ready".
     console.log(`Rating changes not available yet for contest ${contestId}: ${e.message}`);
     return { ready: false, promoted: [] };
+  }
+}
+
+// ─── Rating Poll → Auto Promotion/Rating Announcements ─────────────────────
+// Replaces the old contest.ratingChanges-based approach in checkAndAnnounceWinner.
+// That approach had to (a) guess which contest just finished, (b) only ever
+// looked at the SINGLE most recent one — so a contest missed during downtime
+// was skipped forever — and (c) had to poll-and-wait up to 20h for CF to
+// publish ratingChanges for that specific contest.
+//
+// This is simpler and can never permanently miss anything: every ~10-12 min
+// (same cadence as syncSolveHistory) we ask CF for each handle's CURRENT
+// rating and diff it against the last value we stored. It doesn't matter how
+// many contests happened, or how long the bot was asleep, or whether CF is
+// slow to publish — whatever the rating IS right now vs last check is the
+// truth, and it's caught on the very next sweep.
+//
+// Dedup / no-duplicate-messages guarantee: the new rating is persisted to
+// Mongo immediately, before/regardless of any message send. So even if the
+// bot restarts mid-way, or a sendMessage call fails for one group, the next
+// sweep is comparing against the value we already saved — it will never see
+// the same "old → new" diff twice. (Trade-off: if sendMessage itself fails,
+// that one group misses that one announcement rather than getting a
+// duplicate later — which is the right way round to fail.)
+async function checkRatingChangesAndAnnounce(sock) {
+  const groups = await CFData.find({}).lean();
+  const allHandles = [];
+  for (const g of groups)
+    for (const list of Object.values(g.members || {}))
+      for (const h of list)
+        if (!allHandles.includes(h)) allHandles.push(h);
+  if (!allHandles.length) return;
+
+  const BATCH = 50; // CF's user.info tolerates many handles per call, but keep batches modest
+  const changed = []; // { handle, oldRating, newRating, oldRank, newRank, delta, promoted }
+
+  for (let i = 0; i < allHandles.length; i += BATCH) {
+    const batch = allHandles.slice(i, i + BATCH);
+    const users = await getCFUsers(batch);
+
+    for (const u of users) {
+      // upsert so a brand-new handle (not yet touched by syncSolveHistory)
+      // still gets a doc with rating baseline established this sweep
+      const doc = await SolveHistory.findOneAndUpdate(
+        { handle: u.handle },
+        { $setOnInsert: { handle: u.handle, solves: [], totalSolved: 0 } },
+        { upsert: true, new: true }
+      );
+
+      const oldRating = doc.rating; // null → we've never recorded this handle's rating before
+      const newRating = u.rating ?? null;
+
+      if (newRating !== oldRating) {
+        await SolveHistory.updateOne({ handle: u.handle }, { $set: { rating: newRating } });
+      }
+
+      if (oldRating === undefined || oldRating === null) continue; // first sighting — just establishes baseline, no announcement
+      if (newRating === oldRating) continue; // nothing changed for this handle
+
+      const oldRank = getRankFromRating(oldRating);
+      const newRank = getRankFromRating(newRating);
+      changed.push({
+        handle: u.handle,
+        oldRating,
+        newRating,
+        oldRank,
+        newRank,
+        delta: (newRating ?? 0) - (oldRating ?? 0),
+        promoted: getRankIndex(newRank) > getRankIndex(oldRank),
+      });
+    }
+
+    if (i + BATCH < allHandles.length) await sleep(1000);
+  }
+
+  if (!changed.length) return;
+
+  // Fan the changes out to every allowed group that has at least one affected handle.
+  for (const group of groups) {
+    const chatId = group.chatId;
+    if (!chatId.endsWith("@g.us")) continue;
+    if (!isGroupAllowed(chatId)) continue;
+
+    const groupHandles = getAllHandles(group);
+    const groupChanged = changed.filter(c => groupHandles.includes(c.handle));
+    if (!groupChanged.length) continue;
+
+    groupChanged.sort((a, b) => (b.newRating ?? 0) - (a.newRating ?? 0));
+    const promoted = groupChanged.filter(c => c.promoted);
+
+    let msg = `📊 *Rating Update!*\n${"─".repeat(28)}\n\n`;
+    groupChanged.forEach(c => {
+      const arrow = c.delta >= 0 ? "🔼" : "🔽";
+      msg += `${arrow} *${c.handle}*: ${c.oldRating} → *${c.newRating}* (${c.delta >= 0 ? "+" : ""}${c.delta})\n`;
+    });
+
+    if (promoted.length) {
+      msg += `\n🎉 *Promotion Alerts!* 🎉\n\n`;
+      for (const p of promoted) {
+        msg += `@${p.handle} — Congratulations! Promoted from *${p.oldRank}* to *${p.newRank}*! 🚀\n`;
+      }
+      msg += `\n🔥 Keep up the great work! 💪`;
+    }
+
+    try {
+      await sock.sendMessage(chatId, { text: msg.trim() });
+    } catch (e) {
+      console.error(`Failed to send rating update to ${chatId}:`, e.message);
+    }
   }
 }
 
@@ -1702,7 +1752,10 @@ function startCronJobs() {
   console.log("✅ Cron jobs started (single instance — survives reconnects)");
   setInterval(() => { if (activeSock) checkAndSendReminders(activeSock); }, 10 * 60 * 1000);
   setInterval(() => { if (activeSock) checkAndAnnounceWinner(activeSock); }, 5 * 60 * 1000);
-  setInterval(() => { syncSolveHistory(); }, 12 * 60 * 1000); // full sweep, batch-of-2 pacing, no sock needed
+  setInterval(() => {
+    syncSolveHistory(); // full sweep, batch-of-2 pacing, no sock needed
+    if (activeSock) checkRatingChangesAndAnnounce(activeSock); // rating diff + promotion announce
+  }, 12 * 60 * 1000);
 }
 
 async function startBot() {
@@ -1749,6 +1802,9 @@ async function startBot() {
 
       console.log("🚀 Running immediate solve-history sync (batch-of-2 pacing)...");
       syncSolveHistory();
+
+      console.log("🚀 Running immediate rating-baseline check...");
+      checkRatingChangesAndAnnounce(sock);
 
       setTimeout(() => {
         if (activeSock !== sock) return; // a newer connection has since taken over
