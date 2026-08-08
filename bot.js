@@ -797,7 +797,7 @@ async function checkAndSendReminders(sock) {
 
           console.log(`⏰ ${contest.platform} - ${contest.name}: ${hoursLeft}h ${minsLeft % 60}m left`);
 
-          // Day-before reminder. Window widened to (1h, 24h] — previously this
+          // Day-before reminder only. Window widened to (1h, 24h] — previously this
           // was a narrow 22-26h slot, so any downtime/slow API call during
           // that exact 4h window meant the reminder was lost forever. Now,
           // as long as the bot is up *at any point* in that 23h span, it'll
@@ -811,22 +811,6 @@ async function checkAndSendReminders(sock) {
               console.log(`✅ Day reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
             } else {
               console.log(`⚠️ Day reminder FAILED to send for ${contest.id} — will retry next cycle`);
-            }
-          }
-
-          // Hour-before reminder. Window widened to (0, 60min] for the same
-          // catch-up reason. Crucially: the flag is ONLY set when sendReminder
-          // actually confirms delivery — a failed sock.sendMessage() no longer
-          // gets silently recorded as "sent".
-          if (diff > 0 && diff <= 60 * 60 && !reminders[contest.id]?.hourSent) {
-            const ok = await sendReminder(sock, chatId, contest, "hour");
-            if (ok) {
-              if (!reminders[contest.id]) reminders[contest.id] = { startTimeSeconds: contest.startTimeSeconds };
-              reminders[contest.id].hourSent = true;
-              changed = true;
-              console.log(`✅ Hour reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
-            } else {
-              console.log(`⚠️ Hour reminder FAILED to send for ${contest.id} — will retry next cycle`);
             }
           }
         }
@@ -863,16 +847,9 @@ async function checkAndSendReminders(sock) {
 
 async function sendReminder(sock, chatId, contest, type) {
   const diff = contest.startTimeSeconds - Math.floor(Date.now() / 1000);
-  let timeLeft = "";
-  if (type === "day") {
-    const days = Math.floor(diff / 86400);
-    const hours = Math.floor((diff % 86400) / 3600);
-    timeLeft = `${days} day${days>1?'s':''} ${hours} hour${hours>1?'s':''}`;
-  } else {
-    const hours = Math.floor(diff / 3600);
-    const mins = Math.floor((diff % 3600) / 60);
-    timeLeft = `${hours}h ${mins}m`;
-  }
+  const days = Math.floor(diff / 86400);
+  const hours = Math.floor((diff % 86400) / 3600);
+  const timeLeft = `${days} day${days>1?'s':''} ${hours} hour${hours>1?'s':''}`;
 
   const emoji = contest.platform === "Codeforces" ? "🔵" :
                 contest.platform === "CodeChef" ? "🟤" :
@@ -1970,7 +1947,6 @@ async function startBot() {
         if (command.startsWith("// add ")) {
           const args = body.slice(7).trim().split(/\s+/).filter(Boolean);
           if (!args.length) { await reply("❌ Usage: `// add <cf_handle>`\nOr multiple: `// add h1 h2 h3`"); continue; }
-          await reply(`🔍 Verifying ${args.length} handle(s)...`);
           if (!groupData.members[senderId]) groupData.members[senderId] = [];
           const results = [];
           const newlyAdded = [];
@@ -2022,7 +1998,6 @@ async function startBot() {
         else if (command === "// rating") {
           const handles = getAllHandles(groupData);
           if (!handles.length) { await reply("📭 No one registered yet!\nUse `// add your_cf_id` to join."); continue; }
-          await reply(`⏳ Fetching ratings for ${handles.length} member(s)...`);
           const users = await getCFUsers(handles);
           if (!users.length) { await reply("❌ Failed to fetch. Try again."); continue; }
           users.sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1));
@@ -2049,7 +2024,6 @@ async function startBot() {
 
         // ── // upcoming ──────────────────────────────────────────────────
         else if (command === "// upcoming") {
-          await reply("⏳ Fetching upcoming contests from all platforms...");
           const [cf, lc, cc, at] = await Promise.all([
             getCFUpcoming(),
             getLeetCodeUpcoming(),
@@ -2122,8 +2096,6 @@ async function startBot() {
           }
 
           for (const contest of solvedContests) {
-            await reply(`⏳ Fetching standings for *${contest.name}*...`);
-
             const result = await getContestStandings(contest.id, handles);
             if (!result.success) {
               await reply(`❌ Failed to fetch standings for *${contest.name}*: ${result.error}`);
@@ -2163,8 +2135,6 @@ async function startBot() {
             );
             continue;
           }
-
-          await reply(`🔎 Finding a ${rating}-rated problem...`);
 
           const problem = await getRandomProblemByRating(rating);
           if (!problem) {
@@ -2223,8 +2193,6 @@ async function startBot() {
             }
           }
 
-          await reply(`⏳ Fetching standings for *${contestInfo.name}*...`);
-
           const result = await getContestStandings(contestId, handles);
           if (!result.success) {
             await reply(`❌ Failed to fetch standings: ${result.error}`);
@@ -2255,7 +2223,6 @@ async function startBot() {
             await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
             continue;
           }
-          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* today...\n_Checking ${handles.length} member(s) — few seconds_`);
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
           const todayIST = new Date(Date.now() + IST_OFFSET_MS);
           todayIST.setHours(0, 0, 0, 0);
@@ -2328,7 +2295,6 @@ async function startBot() {
             await reply("📭 No members registered.\nUse `// add your_cf_id` to join.");
             continue;
           }
-          await reply(`🔍 Checking who solved *${contestId}${problemIndex}* yesterday...\n_Checking ${handles.length} member(s) — few seconds_`);
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
           const todayIST = new Date(Date.now() + IST_OFFSET_MS);
           todayIST.setHours(0, 0, 0, 0);
@@ -2387,7 +2353,6 @@ async function startBot() {
         else if (command.startsWith("// streak")) {
           const arg = body.slice(9).trim();
           if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
-          await reply(`⏳ Fetching streak for *${arg}*... _few seconds_`);
           const streak = await getCFStreak(arg);
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
           const curFire = streakFire(streak.current);
@@ -2407,7 +2372,6 @@ async function startBot() {
         else if (command.startsWith("// info")) {
           const arg = body.slice(7).trim();
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
-          await reply(`⏳ Fetching info for *${arg}*...\n_few seconds_`);
           const [info, qData] = await Promise.all([
             getCFUserInfo(arg),
             getCFUserInfoQ(arg),
@@ -2439,7 +2403,6 @@ async function startBot() {
           const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
           const [h1, h2] = args;
-          await reply(`⏳ Comparing *${h1}* vs *${h2}*...\n_few seconds_`);
           const info1 = await getCFUserForCompare(h1);
           if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check the handle and try again.`); continue; }
           await sleep(500);
@@ -2690,7 +2653,7 @@ ${"─".repeat(28)}
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `🥇 *Winner Alert*\n   _Announced live right after_\n   _every CF contest — automatic!_\n\n` +
             `🎉 *Promotion Alert*\n   _Congrats when you rank up!_\n\n` +
-            `⏰ *Contest Reminder*\n   _Auto sent 24h & 1h before_\n   _every contest. Never miss one!_\n\n` +
+            `⏰ *Contest Reminder*\n   _Auto sent 1 day before_\n   _every contest. Never miss one!_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n` +
             `✦  *Code hard. Rank higher.* 🚀\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰`
