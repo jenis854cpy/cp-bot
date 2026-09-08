@@ -731,6 +731,21 @@ async function checkAndSendReminders(sock) {
               console.log(`⚠️ Day reminder FAILED to send for ${contest.id} — will retry next cycle`);
             }
           }
+
+          // 1-hour-before reminder. Window widened to (0, 70min] instead of a
+          // narrow slot around 60m — the check runs every 10 min, so a tight
+          // window risks getting skipped entirely if a cycle is slow/late.
+          if (diff > 0 && diff <= 70 * 60 && !reminders[contest.id]?.hourSent) {
+            const ok = await sendReminder(sock, chatId, contest, "hour");
+            if (ok) {
+              if (!reminders[contest.id]) reminders[contest.id] = { startTimeSeconds: contest.startTimeSeconds };
+              reminders[contest.id].hourSent = true;
+              changed = true;
+              console.log(`✅ Hour reminder sent for ${contest.id} (${contest.name}) to ${chatId}`);
+            } else {
+              console.log(`⚠️ Hour reminder FAILED to send for ${contest.id} — will retry next cycle`);
+            }
+          }
         }
 
         // Garbage-collect flags for contests that started 2+ days ago so the
@@ -767,14 +782,24 @@ async function sendReminder(sock, chatId, contest, type) {
   const diff = contest.startTimeSeconds - Math.floor(Date.now() / 1000);
   const days = Math.floor(diff / 86400);
   const hours = Math.floor((diff % 86400) / 3600);
-  const timeLeft = `${days} day${days>1?'s':''} ${hours} hour${hours>1?'s':''}`;
+  const minutes = Math.floor((diff % 3600) / 60);
+
+  let timeLeft;
+  if (days > 0) {
+    timeLeft = `${days} day${days > 1 ? 's' : ''} ${hours} hour${hours !== 1 ? 's' : ''}`;
+  } else if (hours > 0) {
+    timeLeft = `${hours} hour${hours !== 1 ? 's' : ''} ${minutes} min${minutes !== 1 ? 's' : ''}`;
+  } else {
+    timeLeft = `${Math.max(minutes, 1)} min${minutes !== 1 ? 's' : ''}`;
+  }
 
   const emoji = contest.platform === "Codeforces" ? "🔵" :
                 contest.platform === "CodeChef" ? "🟤" :
                 contest.platform === "LeetCode" ? "🟡" :
                 contest.platform === "AtCoder" ? "🟣" : "⚪";
 
-  let message = `📢 *${contest.platform} Contest Reminder!*\n`;
+  const heading = type === "hour" ? "Starting Soon!" : "Contest Reminder!";
+  let message = `📢 *${contest.platform} ${heading}*\n`;
   message += `${"─".repeat(28)}\n\n`;
   message += `${emoji} *${contest.name}*\n`;
   message += `🕐 Starts in: *${timeLeft}*\n`;
@@ -1211,8 +1236,8 @@ function formatContestStandings(results, totalProblems, isLive, contestInfo) {
     const medals = ['🥇', '🥈', '🥉'];
     active.forEach((r, i) => {
       const medal = i < 3 ? medals[i] : '';
-      const rankDisplay = isLive ? 'Unrated' : (r.rank != null ? `#${r.rank}` : 'N/A');
-      text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q) | Rank ${rankDisplay}\n`;
+      const rankSuffix = isLive ? '' : ` | Rank ${r.rank != null ? `#${r.rank}` : 'N/A'}`;
+      text += `${medal} ${ordinal(i + 1)} *${r.handle}* (${r.solved}/${totalProblems} Q)${rankSuffix}\n`;
     });
     text += '\n';
   }
@@ -2540,7 +2565,7 @@ ${"─".repeat(28)}
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `🥇 *Winner Alert*\n   _Announced live right after_\n   _every CF contest — automatic!_\n\n` +
             `🎉 *Promotion Alert*\n   _Congrats when you rank up!_\n\n` +
-            `⏰ *Contest Reminder*\n   _Auto sent 1 day before_\n   _every contest. Never miss one!_\n\n` +
+            `⏰ *Contest Reminder*\n   _Auto sent 1 day before &_\n   _1 hour before every contest!_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n` +
             `✦  *Code hard. Rank higher.* 🚀\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰`
