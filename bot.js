@@ -77,6 +77,9 @@ const SolveHistory = mongoose.model("SolveHistory",
     },
     totalSolved: { type: Number, default: 0 }, // lifetime counter — never decrements
     lastSynced: { type: Date, default: null },
+    monthKey: { type: String, default: "" },   // IST calendar month, e.g. "2026-09"
+    monthSolved: { type: Number, default: 0 }, // unique problems first-solved this IST month
+    monthPoints: { type: Number, default: 0 }, // points from those problems
     rating: { type: Number, default: null }, // last KNOWN current CF rating — null = never synced yet (baseline not established)
   }));
 
@@ -1617,6 +1620,14 @@ async function getDelta7(handles) {
   return results.sort((a, b) => b.points - a.points || b.count - a.count);
 }
 
+// ─── IST month helpers (for delta7 monthly highlights) ─────────────────────────
+function getISTMonthKey(unixSeconds) {
+  const d = new Date(unixSeconds * 1000 + 5.5 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 7); // "YYYY-MM"
+}
+const MONTH_NAMES = ["January","February","March","April","May","June","July",
+  "August","September","October","November","December"];
+
 // ─── Background Solve-History Sync ─────────────────────────────────────────────
 // Keeps SolveHistory (one doc per handle) up to date so `// delta7` can read
 // straight from MongoDB with zero CF API calls in the command path.
@@ -1671,6 +1682,9 @@ async function syncSolveHistory(specificHandles) {
         const allUniqueKeys = new Set();
         const sevenDaySolves = [];
         const nowSec = Math.floor(Date.now() / 1000);
+        const curMonthKey = getISTMonthKey(nowSec);
+        let monthSolved = 0;
+        let monthPoints = 0;
 
         for (const s of subs) {
           if (s.verdict !== "OK" || !s.problem) continue;
@@ -1678,6 +1692,11 @@ async function syncSolveHistory(specificHandles) {
           if (allUniqueKeys.has(key)) continue; // dedupe: only first AC per problem
           allUniqueKeys.add(key);
           const rating = s.problem.rating || 0;
+          // Monthly stats (IST calendar month) for the delta7 highlights
+          if (getISTMonthKey(s.creationTimeSeconds) === curMonthKey) {
+            monthSolved++;
+            monthPoints += calculatePointsForRating(rating);
+          }
           // Only keep in the rolling 7-day array if solved recently
           if (nowSec - s.creationTimeSeconds <= SEVEN_DAYS_SEC) {
             sevenDaySolves.push({
@@ -1691,6 +1710,9 @@ async function syncSolveHistory(specificHandles) {
 
         doc.totalSolved = allUniqueKeys.size; // always accurate — no incremental drift
         doc.solves = sevenDaySolves;           // only last-7-days solves for delta7
+        doc.monthKey = curMonthKey;
+        doc.monthSolved = monthSolved;
+        doc.monthPoints = monthPoints;
 
         doc.lastSynced = new Date();
         await doc.save();
@@ -1884,26 +1906,6 @@ async function startBot() {
           if (args.length > 1) text += `\n\n👥 ${added} added${failed ? `, ${failed} failed` : ""}`;
           if (newlyAdded.length) text += `\n\n⏳ _Fetching solve history for ${newlyAdded.length > 1 ? "these handles" : "this handle"} — \`// delta7\` and \`// totals\` will be ready shortly._`;
           await reply(text);
-        }
-
-        // ── // remove ──────────────────────────────────────────────────────
-        else if (command.startsWith("// remove")) {
-          const myHandles = groupData.members[senderId] || [];
-          if (!myHandles.length) { await reply("❌ You haven't registered any CF handles."); continue; }
-          const arg = body.slice(9).trim();
-          if (!arg) {
-            delete groupData.members[senderId];
-            await saveGroupData(chatId, groupData);
-            await reply(`✅ Removed all your handles: *${myHandles.join(", ")}*`);
-          } else {
-            const idx = myHandles.findIndex((h) => h.toLowerCase() === arg.toLowerCase());
-            if (idx === -1) { await reply(`❌ *${arg}* not found.\nYour handles: ${myHandles.join(", ")}`); continue; }
-            myHandles.splice(idx, 1);
-            if (!myHandles.length) delete groupData.members[senderId];
-            else groupData.members[senderId] = myHandles;
-            await saveGroupData(chatId, groupData);
-            await reply(`✅ Removed *${arg}* from your handles.`);
-          }
         }
 
         // ── // rating ──────────────────────────────────────────────────────
@@ -2375,9 +2377,28 @@ async function startBot() {
             return { handle, points, count: fresh.length };
           }).sort((a, b) => b.points - a.points || a.count - b.count);
 
+          // ── Monthly highlights (IST calendar month) ──
+          // Ignore docs whose monthKey is stale (new month started, not re-synced yet).
+          const curMonthKey = getISTMonthKey(nowSec);
+          const monthStats = docs
+            .filter((d) => d.monthKey === curMonthKey && (d.monthSolved || 0) > 0)
+            .map((d) => ({ handle: d.handle, solved: d.monthSolved || 0, pts: d.monthPoints || 0 }));
+          const topSolver = monthStats.length
+            ? [...monthStats].sort((a, b) => b.solved - a.solved || b.pts - a.pts)[0] : null;
+          const topScorer = monthStats.length
+            ? [...monthStats].sort((a, b) => b.pts - a.pts || a.solved - b.solved)[0] : null;
+          const monthName = MONTH_NAMES[parseInt(curMonthKey.slice(5, 7), 10) - 1];
+
           const active = results.filter((r) => r.points > 0);
 
           let text = `📈 *Delta7 (Last 7 Days)*\n${"─".repeat(28)}\n📅 Rolling 7-day points\n\n`;
+
+          if (topSolver && topScorer) {
+            text += `🏆 *${monthName} Highlights*\n`;
+            text += `🧩 Most solved: *${topSolver.handle}* — ${topSolver.solved} problems (${topSolver.pts} pts)\n`;
+            text += `⭐ Most points: *${topScorer.handle}* — ${topScorer.pts} pts (${topScorer.solved} problems)\n\n`;
+            text += `${"─".repeat(28)}\n`;
+          }
 
           if (!active.length) {
             text += `😴 No one solved any problems this week!\nStart grinding! 💪`;
@@ -2531,8 +2552,6 @@ ${"─".repeat(28)}
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
             `➕ \`// add <cf_id>\`\n   _Register your CF handle_\n\n` +
             `➕ \`// add h1 h2 h3\`\n   _Add multiple handles at once_\n\n` +
-            `➖ \`// remove\`\n   _Delete all your handles_\n\n` +
-            `➖ \`// remove <cf_id>\`\n   _Delete a specific handle_\n\n` +
             `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n` +
             `🏷 *[ 02 ]  LEADERBOARDS & STATS*\n` +
             `╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\n` +
