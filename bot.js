@@ -1509,8 +1509,11 @@ async function checkRatingChangesAndAnnounce(sock) {
         { upsert: true, new: true }
       );
 
-      const oldRating = doc.rating; // null → we've never recorded this handle's rating before
-      const newRating = u.rating ?? null;
+      const oldRating = doc.rating; // null → we've never recorded this handle's rating before (0 = known to be unrated)
+      // Unrated handles are stored as 0 (not null). That way null still means
+      // "never checked" (baseline, no announcement) while 0 means "checked and
+      // unrated", so a first contest announces as 0 → X.
+      const newRating = u.rating ?? 0;
 
       if (newRating !== oldRating) {
         await SolveHistory.updateOne({ handle: u.handle }, { $set: { rating: newRating } });
@@ -1519,7 +1522,7 @@ async function checkRatingChangesAndAnnounce(sock) {
       if (oldRating === undefined || oldRating === null) continue; // first sighting — just establishes baseline, no announcement
       if (newRating === oldRating) continue; // nothing changed for this handle
 
-      const oldRank = getRankFromRating(oldRating);
+      const oldRank = oldRating === 0 ? "Unrated" : getRankFromRating(oldRating);
       const newRank = getRankFromRating(newRating);
       changed.push({
         handle: u.handle,
