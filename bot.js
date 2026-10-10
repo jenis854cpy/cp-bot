@@ -81,6 +81,14 @@ const SolveHistory = mongoose.model("SolveHistory",
     monthSolved: { type: Number, default: 0 }, // unique problems first-solved this IST month
     monthPoints: { type: Number, default: 0 }, // points from those problems
     rating: { type: Number, default: null }, // last KNOWN current CF rating — null = never synced yet (baseline not established)
+    // ── Stored profile data, read by `// info` (no live CF calls needed) ──
+    rank: { type: String, default: null },        // current CF rank, as CF returns it (lowercase)
+    maxRating: { type: Number, default: null },
+    maxRank: { type: String, default: null },
+    contests: { type: Number, default: null },    // number of rated contests
+    ratingCounts: { type: mongoose.Schema.Types.Mixed, default: null }, // { "800": 40, "900": 25, ... } unique solved per exact problem rating
+    unratedSolved: { type: Number, default: 0 },  // solved problems that have no rating on CF
+    infoSyncedAt: { type: Date, default: null },  // when the profile fields above were last refreshed
   }));
 
 // ─── MongoDB Auth State ────────────────────────────────────────────────────────
@@ -406,7 +414,7 @@ async function getCFStreak(handle) {
   }
 }
 
-// ─── CF User Info Q ──────────────────────────────────────────────────────────
+// ─── Rating buckets + stored/live profile info for `// info` ─────────────────
 // Each entry: [lo, hi] where BOTH lo and hi are INCLUSIVE.
 // The bucket check uses r >= lo && r <= hi (or r >= lo for the last open bucket).
 const RATING_RANGES = [
@@ -423,64 +431,65 @@ function inRange(r, [lo, hi]) {
   return hi === Infinity ? r >= lo : r >= lo && r <= hi;
 }
 
-async function getCFUserInfoQ(handle) {
-  try {
-    const res = await axios.get(
-      `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-      { timeout: 20000 }
-    );
-    const subs = res.data.result || [];
-    const solved = new Set();
-    const buckets = {};
-    for (const range of RATING_RANGES) buckets[rangeLabel(range)] = 0;
-    for (const s of subs) {
-      if (s.verdict === "OK" && s.problem) {
-        const key = `${s.problem.contestId}-${s.problem.index}`;
-        if (!solved.has(key)) {
-          solved.add(key);
-          const r = s.problem.rating;
-          if (r) {
-            for (const range of RATING_RANGES) {
-              if (inRange(r, range)) { buckets[rangeLabel(range)]++; break; }
-            }
-          }
-        }
-      }
-    }
-    return { total: solved.size, buckets };
-  } catch { return null; }
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// ─── CF User Info (scrapes profile) ──────────────────────────────────────────
-async function getCFUserInfo(handle) {
+function titleCase(str) {
+  return String(str || "").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// How long a stored profile counts as fresh for `// info`. Tracked handles are
+// re-synced every ~12 min, so they are practically always inside this window.
+const INFO_FRESH_MS = 30 * 60 * 1000;
+
+// A stored doc can only serve `// info` if every field it shows is present.
+function isInfoDocComplete(doc) {
+  return !!(doc && doc.infoSyncedAt && doc.rating != null && doc.maxRank &&
+            doc.contests != null && doc.ratingCounts);
+}
+
+function buildInfoFromDoc(doc) {
+  return {
+    handle: doc.handle,
+    rating: doc.rating || null,          // 0 in DB means unrated
+    maxRating: doc.maxRating || null,
+    rank: doc.rank || "newbie",
+    maxRank: doc.maxRank || "newbie",
+    contests: doc.contests ?? 0,
+    totalSolved: doc.totalSolved ?? 0,
+    ratingCounts: doc.ratingCounts || {},
+    unratedSolved: doc.unratedSolved || 0,
+  };
+}
+
+// Live fetch (official API only — no HTML scraping, which Cloudflare blocks
+// from Render). Used only when a handle isn't stored yet or is stale.
+async function getCFUserInfoLive(handle) {
   try {
-    const [userRes, ratingRes, profileRes] = await Promise.all([
-      axios.get(`https://codeforces.com/api/user.info?handles=${handle}`, { timeout: 8000 }),
-      axios.get(`https://codeforces.com/api/user.rating?handle=${handle}`, { timeout: 8000 }),
-      axios.get(`https://codeforces.com/profile/${handle}`, {
-        timeout: 10000,
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" },
-      }),
+    const enc = encodeURIComponent(handle);
+    const [userRes, ratingRes, statusRes] = await Promise.all([
+      axios.get(`https://codeforces.com/api/user.info?handles=${enc}`, { timeout: 10000 }),
+      axios.get(`https://codeforces.com/api/user.rating?handle=${enc}`, { timeout: 10000 }).catch(() => null),
+      axios.get(`https://codeforces.com/api/user.status?handle=${enc}&from=1&count=10000`, { timeout: 30000 }).catch(() => null),
     ]);
     const u = userRes.data.result[0];
-    const contests = ratingRes.data.result?.length ?? 0;
-    const html = profileRes.data;
-    let totalSolved = 0;
-    const solvedPatterns = [
-      /(\d+)\s*problems?\s*solved/i,
-      /solved\s*:\s*(\d+)/i,
-      /"problemsSolved"[^>]*>(\d+)/i,
-      /Problems solved[^<]*<[^>]+>(\d+)/i,
-      /_UserActivityFrame_[^>]*>[\s\S]*?(\d+)\s*problems/i,
-    ];
-    for (const p of solvedPatterns) {
-      const m = html.match(p);
-      if (m) { totalSolved = parseInt(m[1]); break; }
-    }
-    if (!totalSolved) {
-      const section = html.match(/solved[\s\S]{0,200}/i)?.[0] || "";
-      const num = section.match(/(\d+)/)?.[1];
-      if (num) totalSolved = parseInt(num);
+    const contests = ratingRes?.data?.status === "OK" ? (ratingRes.data.result?.length ?? 0) : null;
+
+    let totalSolved = null, ratingCounts = null, unratedSolved = 0;
+    if (statusRes?.data?.status === "OK") {
+      const seen = new Set();
+      ratingCounts = {};
+      for (const sub of statusRes.data.result || []) {
+        if (sub.verdict !== "OK" || !sub.problem) continue;
+        const key = `${sub.problem.contestId}-${sub.problem.index}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const r = sub.problem.rating;
+        if (r) ratingCounts[r] = (ratingCounts[r] || 0) + 1;
+        else unratedSolved++;
+      }
+      totalSolved = seen.size;
     }
     return {
       handle: u.handle,
@@ -488,11 +497,66 @@ async function getCFUserInfo(handle) {
       maxRating: u.maxRating ?? null,
       rank: u.rank ?? "newbie",
       maxRank: u.maxRank ?? "newbie",
-      totalSolved,
-      ratingBuckets: {},
       contests,
+      totalSolved,
+      ratingCounts,
+      unratedSolved,
     };
-  } catch { return null; }
+  } catch (e) {
+    console.error(`getCFUserInfoLive error for ${handle}:`, e.message);
+    return null;
+  }
+}
+
+// Cache a complete live result so the next `// info` for this handle is instant.
+async function saveInfoToDb(info) {
+  if (!info || info.ratingCounts == null || info.contests == null) return; // partial — don't cache
+  await SolveHistory.updateOne(
+    { handle: info.handle },
+    {
+      $set: {
+        rank: info.rank,
+        maxRating: info.maxRating ?? 0,
+        maxRank: info.maxRank,
+        contests: info.contests,
+        totalSolved: info.totalSolved,
+        ratingCounts: info.ratingCounts,
+        unratedSolved: info.unratedSolved,
+        infoSyncedAt: new Date(),
+      },
+      $setOnInsert: { solves: [] },
+    },
+    { upsert: true }
+  );
+  // Only ever fill the rating baseline if it was never set — never overwrite an
+  // existing value, or the rating-change announcer would miss that change.
+  await SolveHistory.updateOne(
+    { handle: info.handle, rating: null },
+    { $set: { rating: info.rating ?? 0 } }
+  );
+}
+
+// `// info` entry point: stored data first, live fetch only if missing/stale.
+async function getUserInfoSmart(handle) {
+  let doc = null;
+  try {
+    doc = await SolveHistory.findOne({
+      handle: new RegExp(`^${escapeRegExp(handle)}$`, "i"),
+    }).lean();
+  } catch (e) {
+    console.error("getUserInfoSmart DB read failed:", e.message);
+  }
+  const complete = isInfoDocComplete(doc);
+  if (complete && Date.now() - new Date(doc.infoSyncedAt).getTime() < INFO_FRESH_MS) {
+    return buildInfoFromDoc(doc);
+  }
+  const live = await getCFUserInfoLive(handle);
+  if (live) {
+    saveInfoToDb(live).catch((e) => console.error("saveInfoToDb failed:", e.message));
+    return live;
+  }
+  if (complete) return buildInfoFromDoc(doc); // CF unreachable — serve stale rather than fail
+  return null;
 }
 
 // ─── Compare Helper ─────────────────────────────────────────────────────────
@@ -1515,8 +1579,14 @@ async function checkRatingChangesAndAnnounce(sock) {
       // unrated", so a first contest announces as 0 → X.
       const newRating = u.rating ?? 0;
 
-      if (newRating !== oldRating) {
-        await SolveHistory.updateOne({ handle: u.handle }, { $set: { rating: newRating } });
+      // Persist the rating plus the profile fields `// info` displays.
+      const setFields = {};
+      if (newRating !== oldRating) setFields.rating = newRating;
+      if (doc.rank !== u.rank) setFields.rank = u.rank;
+      if (doc.maxRating !== (u.maxRating ?? 0)) setFields.maxRating = u.maxRating ?? 0;
+      if (doc.maxRank !== u.maxRank) setFields.maxRank = u.maxRank;
+      if (Object.keys(setFields).length) {
+        await SolveHistory.updateOne({ handle: u.handle }, { $set: setFields });
       }
 
       if (oldRating === undefined || oldRating === null) continue; // first sighting — just establishes baseline, no announcement
@@ -1664,10 +1734,17 @@ async function syncSolveHistory(specificHandles) {
     const batch = handles.slice(i, i + 2);
     await Promise.all(batch.map(async (handle) => {
       try {
-        const res = await axios.get(
-          `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-          { timeout: 30000 }
-        );
+        const enc = encodeURIComponent(handle);
+        // Submissions are required; profile + contest count are best-effort so a
+        // failure there never blocks the solve-history sync.
+        const [res, userRes, ratingRes] = await Promise.all([
+          axios.get(
+            `https://codeforces.com/api/user.status?handle=${enc}&from=1&count=10000`,
+            { timeout: 30000 }
+          ),
+          axios.get(`https://codeforces.com/api/user.info?handles=${enc}`, { timeout: 10000 }).catch(() => null),
+          axios.get(`https://codeforces.com/api/user.rating?handle=${enc}`, { timeout: 10000 }).catch(() => null),
+        ]);
         const subs = res.data.result || [];
 
         let doc = await SolveHistory.findOne({ handle });
@@ -1688,6 +1765,8 @@ async function syncSolveHistory(specificHandles) {
         const curMonthKey = getISTMonthKey(nowSec);
         let monthSolved = 0;
         let monthPoints = 0;
+        const ratingCounts = {};   // exact problem rating -> unique solved count
+        let unratedSolved = 0;
 
         for (const s of subs) {
           if (s.verdict !== "OK" || !s.problem) continue;
@@ -1695,6 +1774,8 @@ async function syncSolveHistory(specificHandles) {
           if (allUniqueKeys.has(key)) continue; // dedupe: only first AC per problem
           allUniqueKeys.add(key);
           const rating = s.problem.rating || 0;
+          if (rating) ratingCounts[rating] = (ratingCounts[rating] || 0) + 1;
+          else unratedSolved++;
           // Monthly stats (IST calendar month) for the delta7 highlights
           if (getISTMonthKey(s.creationTimeSeconds) === curMonthKey) {
             monthSolved++;
@@ -1716,6 +1797,22 @@ async function syncSolveHistory(specificHandles) {
         doc.monthKey = curMonthKey;
         doc.monthSolved = monthSolved;
         doc.monthPoints = monthPoints;
+
+        // ── Profile data for `// info` ──
+        doc.ratingCounts = ratingCounts;
+        doc.markModified("ratingCounts");
+        doc.unratedSolved = unratedSolved;
+        const cfUser = userRes?.data?.result?.[0];
+        if (cfUser) {
+          doc.rank = cfUser.rank ?? "newbie";
+          doc.maxRating = cfUser.maxRating ?? 0;
+          doc.maxRank = cfUser.maxRank ?? "newbie";
+          // Establish the rating baseline only if never set (the rating sweep owns
+          // all later changes, so announcements are never swallowed here).
+          if (doc.rating == null) doc.rating = cfUser.rating ?? 0;
+        }
+        if (ratingRes?.data?.status === "OK") doc.contests = ratingRes.data.result?.length ?? 0;
+        doc.infoSyncedAt = new Date();
 
         doc.lastSynced = new Date();
         await doc.save();
@@ -2286,31 +2383,37 @@ async function startBot() {
         }
 
         // ── // info ──────────────────────────────────────────────────
-        else if (command.startsWith("// info")) {
-          const arg = body.slice(7).trim();
+        else if (command === "// info" || command.startsWith("// info ")) {
+          const arg = body.slice(7).trim().split(/\s+/)[0];
           if (!arg) { await reply("❌ Usage: `// info <cf_handle>`\nExample: `// info tourist`"); continue; }
-          const [info, qData] = await Promise.all([
-            getCFUserInfo(arg),
-            getCFUserInfoQ(arg),
-          ]);
+          const info = await getUserInfoSmart(arg);
           if (!info) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
+
+          const rankName = info.rating ? titleCase(info.rank) : "Unrated";
           let text = `👤 *${info.handle}*\n${"─".repeat(28)}\n\n`;
-          text += `${rankEmoji(info.rank)} Rank: *${info.rank}*\n`;
+          text += `${rankEmoji(rankName)} Rank: *${rankName}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
-          text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}* (${info.maxRank})\n`;
-          text += `🏁 Contests: *${info.contests}*\n\n`;
-          text += `✅ Total Solved: *${info.totalSolved || "N/A"}*\n\n`;
-          if (qData) {
-            const b = qData.buckets;
+          text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}*${info.maxRating ? ` (${titleCase(info.maxRank)})` : ""}\n`;
+          text += `🏁 Contests: *${info.contests ?? "N/A"}*\n\n`;
+          text += `✅ Total Solved: *${info.totalSolved ?? "N/A"}*\n\n`;
+          if (info.ratingCounts) {
+            // Group the exact-rating counts into display buckets
+            const b = {};
+            for (const range of RATING_RANGES) b[rangeLabel(range)] = 0;
+            for (const [r, n] of Object.entries(info.ratingCounts)) {
+              for (const range of RATING_RANGES) {
+                if (inRange(Number(r), range)) { b[rangeLabel(range)] += n; break; }
+              }
+            }
             const maxCount = Math.max(...Object.values(b), 1);
             const bar = (n) => "█".repeat(Math.round((n / maxCount) * 12)) + "░".repeat(12 - Math.round((n / maxCount) * 12));
             text += `📈 *By Rating:*\n`;
             for (const range of RATING_RANGES) {
               const label = rangeLabel(range);
               const count = b[label] || 0;
-              const padded = label.padEnd(9, " ");
-              text += `  ${padded}: ${bar(count)} *${count}*\n`;
+              text += `  ${label.padEnd(9, " ")}: ${bar(count)} *${count}*\n`;
             }
+            if (info.unratedSolved > 0) text += `  ${"Unrated".padEnd(9, " ")}: *${info.unratedSolved}*\n`;
           }
           await reply(text.trim());
         }
