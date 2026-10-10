@@ -88,6 +88,9 @@ const SolveHistory = mongoose.model("SolveHistory",
     contests: { type: Number, default: null },    // number of rated contests
     ratingCounts: { type: mongoose.Schema.Types.Mixed, default: null }, // { "800": 40, "900": 25, ... } unique solved per exact problem rating
     unratedSolved: { type: Number, default: 0 },  // solved problems that have no rating on CF
+    maxStreak: { type: Number, default: null },   // longest daily-solve streak (IST days)
+    currentStreak: { type: Number, default: null }, // streak as of the last sync — always read via effectiveCurrentStreak()
+    lastAcDay: { type: String, default: null },   // most recent IST day (YYYY-MM-DD) with an accepted solve
     infoSyncedAt: { type: Date, default: null },  // when the profile fields above were last refreshed
   }));
 
@@ -370,44 +373,59 @@ function toISTDateStr(unixSeconds) {
   return d.toISOString().slice(0, 10);
 }
 
+// Pure streak calculation from a raw user.status submission list.
+// Shared by `// streak` (live), the background sync, and the live `// info` path.
+function computeStreakFromSubs(subs) {
+  const acDays = new Set();
+  for (const s of subs) {
+    if (s.verdict === "OK")
+      acDays.add(toISTDateStr(s.creationTimeSeconds));
+  }
+  if (acDays.size === 0) return { current: 0, max: 0, lastAcDay: null };
+  const sortedAsc = [...acDays].sort();
+  let maxS = 1, curS = 1;
+  for (let i = 1; i < sortedAsc.length; i++) {
+    const prev = new Date(sortedAsc[i - 1] + "T00:00:00Z");
+    const curr = new Date(sortedAsc[i] + "T00:00:00Z");
+    const diffDays = Math.round((curr - prev) / 86400000);
+    if (diffDays === 1) { curS++; maxS = Math.max(maxS, curS); }
+    else if (diffDays > 1) curS = 1;
+  }
+  const nowIST = toISTDateStr(Math.floor(Date.now() / 1000));
+  let current = 0;
+  let cursor = new Date(nowIST + "T00:00:00Z");
+  if (!acDays.has(nowIST)) {
+    cursor = new Date(cursor.getTime() - 86400000);
+  }
+  while (true) {
+    const dStr = cursor.toISOString().slice(0, 10);
+    if (acDays.has(dStr)) {
+      current++;
+      cursor = new Date(cursor.getTime() - 86400000);
+    } else {
+      break;
+    }
+  }
+  return { current, max: maxS, lastAcDay: sortedAsc[sortedAsc.length - 1] };
+}
+
+// A stored streak goes stale as days pass, so it's only valid while the last
+// solve was today or yesterday (IST) — same rule the live calculation uses.
+function effectiveCurrentStreak(stored, lastAcDay) {
+  if (stored == null || !lastAcDay) return 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const today = toISTDateStr(nowSec);
+  const yesterday = toISTDateStr(nowSec - 86400);
+  return (lastAcDay === today || lastAcDay === yesterday) ? stored : 0;
+}
+
 async function getCFStreak(handle) {
   try {
     const res = await axios.get(
       `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
       { timeout: 20000 }
     );
-    const subs = res.data.result || [];
-    const acDays = new Set();
-    for (const s of subs) {
-      if (s.verdict === "OK")
-        acDays.add(toISTDateStr(s.creationTimeSeconds));
-    }
-    if (acDays.size === 0) return { current: 0, max: 0 };
-    const sortedAsc = [...acDays].sort();
-    let maxS = 1, curS = 1;
-    for (let i = 1; i < sortedAsc.length; i++) {
-      const prev = new Date(sortedAsc[i - 1] + "T00:00:00Z");
-      const curr = new Date(sortedAsc[i] + "T00:00:00Z");
-      const diffDays = Math.round((curr - prev) / 86400000);
-      if (diffDays === 1) { curS++; maxS = Math.max(maxS, curS); }
-      else if (diffDays > 1) curS = 1;
-    }
-    const nowIST = toISTDateStr(Math.floor(Date.now() / 1000));
-    let current = 0;
-    let cursor = new Date(nowIST + "T00:00:00Z");
-    if (!acDays.has(nowIST)) {
-      cursor = new Date(cursor.getTime() - 86400000);
-    }
-    while (true) {
-      const dStr = cursor.toISOString().slice(0, 10);
-      if (acDays.has(dStr)) {
-        current++;
-        cursor = new Date(cursor.getTime() - 86400000);
-      } else {
-        break;
-      }
-    }
-    return { current, max: maxS };
+    return computeStreakFromSubs(res.data.result || []);
   } catch (e) {
     console.error("getCFStreak error:", e.message);
     return null;
@@ -446,7 +464,8 @@ const INFO_FRESH_MS = 30 * 60 * 1000;
 // A stored doc can only serve `// info` if every field it shows is present.
 function isInfoDocComplete(doc) {
   return !!(doc && doc.infoSyncedAt && doc.rating != null && doc.maxRank &&
-            doc.contests != null && doc.ratingCounts);
+            doc.contests != null && doc.ratingCounts &&
+            doc.maxStreak != null && doc.currentStreak != null); // lastAcDay may legitimately be null (no solves)
 }
 
 function buildInfoFromDoc(doc) {
@@ -460,6 +479,9 @@ function buildInfoFromDoc(doc) {
     totalSolved: doc.totalSolved ?? 0,
     ratingCounts: doc.ratingCounts || {},
     unratedSolved: doc.unratedSolved || 0,
+    maxStreak: doc.maxStreak ?? null,
+    currentStreak: effectiveCurrentStreak(doc.currentStreak, doc.lastAcDay),
+    lastAcDay: doc.lastAcDay ?? null,
   };
 }
 
@@ -477,7 +499,10 @@ async function getCFUserInfoLive(handle) {
     const contests = ratingRes?.data?.status === "OK" ? (ratingRes.data.result?.length ?? 0) : null;
 
     let totalSolved = null, ratingCounts = null, unratedSolved = 0;
+    let maxStreak = null, currentStreak = null, lastAcDay = null;
     if (statusRes?.data?.status === "OK") {
+      const st = computeStreakFromSubs(statusRes.data.result || []);
+      maxStreak = st.max; currentStreak = st.current; lastAcDay = st.lastAcDay;
       const seen = new Set();
       ratingCounts = {};
       for (const sub of statusRes.data.result || []) {
@@ -501,6 +526,9 @@ async function getCFUserInfoLive(handle) {
       totalSolved,
       ratingCounts,
       unratedSolved,
+      maxStreak,
+      currentStreak,
+      lastAcDay,
     };
   } catch (e) {
     console.error(`getCFUserInfoLive error for ${handle}:`, e.message);
@@ -522,6 +550,9 @@ async function saveInfoToDb(info) {
         totalSolved: info.totalSolved,
         ratingCounts: info.ratingCounts,
         unratedSolved: info.unratedSolved,
+        maxStreak: info.maxStreak ?? 0,
+        currentStreak: info.currentStreak ?? 0,
+        lastAcDay: info.lastAcDay ?? null,
         infoSyncedAt: new Date(),
       },
       $setOnInsert: { solves: [] },
@@ -557,43 +588,6 @@ async function getUserInfoSmart(handle) {
   }
   if (complete) return buildInfoFromDoc(doc); // CF unreachable — serve stale rather than fail
   return null;
-}
-
-// ─── Compare Helper ─────────────────────────────────────────────────────────
-async function getCFUserForCompare(handle) {
-  try {
-    const userRes = await axios.get(
-      `https://codeforces.com/api/user.info?handles=${handle}`,
-      { timeout: 8000 }
-    );
-    const u = userRes.data.result[0];
-    const ratingRes = await axios.get(
-      `https://codeforces.com/api/user.rating?handle=${handle}`,
-      { timeout: 8000 }
-    );
-    const contests = ratingRes.data.result?.length ?? 0;
-    const subRes = await axios.get(
-      `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=10000`,
-      { timeout: 20000 }
-    );
-    const subs = subRes.data.result || [];
-    const solved = new Set();
-    for (const s of subs)
-      if (s.verdict === "OK" && s.problem)
-        solved.add(`${s.problem.contestId}-${s.problem.index}`);
-    return {
-      handle: u.handle,
-      rating: u.rating ?? null,
-      maxRating: u.maxRating ?? null,
-      rank: u.rank ?? "newbie",
-      maxRank: u.maxRank ?? "newbie",
-      totalSolved: solved.size,
-      contests,
-    };
-  } catch (e) {
-    console.error(`getCFUserForCompare error for ${handle}:`, e.message);
-    return null;
-  }
 }
 
 // ─── Contest Helpers ──────────────────────────────────────────────────────────
@@ -1802,6 +1796,10 @@ async function syncSolveHistory(specificHandles) {
         doc.ratingCounts = ratingCounts;
         doc.markModified("ratingCounts");
         doc.unratedSolved = unratedSolved;
+        const streakStats = computeStreakFromSubs(subs);
+        doc.maxStreak = streakStats.max;
+        doc.currentStreak = streakStats.current;
+        doc.lastAcDay = streakStats.lastAcDay;
         const cfUser = userRes?.data?.result?.[0];
         if (cfUser) {
           doc.rank = cfUser.rank ?? "newbie";
@@ -2365,13 +2363,20 @@ async function startBot() {
 
         // ── // streak ──────────────────────────────────────────────────
         else if (command.startsWith("// streak")) {
-          const arg = body.slice(9).trim();
+          const arg = body.slice(9).trim().split(/\s+/)[0];
           if (!arg) { await reply("❌ Usage: `// streak <cf_handle>`\nExample: `// streak tourist`"); continue; }
-          const streak = await getCFStreak(arg);
+          // Stored data first; live API only if the handle isn't stored/stale.
+          const sInfo = await getUserInfoSmart(arg);
+          let streak = null;
+          if (sInfo && sInfo.currentStreak != null && sInfo.maxStreak != null) {
+            streak = { current: sInfo.currentStreak, max: sInfo.maxStreak };
+          } else {
+            streak = await getCFStreak(arg); // last resort: submissions call failed in the live path
+          }
           if (!streak) { await reply(`❌ Could not fetch *${arg}*. Check handle and try again.`); continue; }
           const curFire = streakFire(streak.current);
           const maxFire = streakFire(streak.max);
-          let text = `🔥 *Streak — ${arg}*\n${"─".repeat(28)}\n\n`;
+          let text = `🔥 *Streak — ${sInfo?.handle || arg}*\n${"─".repeat(28)}\n\n`;
           text += `${curFire} Current Streak: *${streak.current} days*\n`;
           text += `🏆 Max Streak Ever: *${streak.max} days* ${maxFire}\n`;
           if (streak.current === 0) text += `\n💤 No active streak.\n💪 Solve a problem today to start one!`;
@@ -2394,7 +2399,11 @@ async function startBot() {
           text += `${rankEmoji(rankName)} Rank: *${rankName}*\n`;
           text += `📊 Rating: *${info.rating ?? "Unrated"}*\n`;
           text += `🚀 Max Rating: *${info.maxRating ?? "N/A"}*${info.maxRating ? ` (${titleCase(info.maxRank)})` : ""}\n`;
-          text += `🏁 Contests: *${info.contests ?? "N/A"}*\n\n`;
+          text += `🏁 Contests: *${info.contests ?? "N/A"}*\n`;
+          if (info.currentStreak != null && info.maxStreak != null) {
+            text += `${streakFire(info.currentStreak)} Streak: *${info.currentStreak} days* (Max: *${info.maxStreak} days*)\n`;
+          }
+          text += `\n`;
           text += `✅ Total Solved: *${info.totalSolved ?? "N/A"}*\n\n`;
           if (info.ratingCounts) {
             // Group the exact-rating counts into display buckets
@@ -2423,27 +2432,28 @@ async function startBot() {
           const args = body.slice(10).trim().split(/\s+/).filter(Boolean);
           if (args.length !== 2) { await reply("❌ Usage: `// compare <cf_id1> <cf_id2>`\nExample: `// compare tourist jiangly`"); continue; }
           const [h1, h2] = args;
-          const info1 = await getCFUserForCompare(h1);
+          // Stored data first (instant); live API only for handles not stored/stale.
+          const [info1, info2] = await Promise.all([
+            getUserInfoSmart(h1),
+            getUserInfoSmart(h2),
+          ]);
           if (!info1) { await reply(`❌ Could not fetch *${h1}*. Check the handle and try again.`); continue; }
-          await sleep(500);
-          const info2 = await getCFUserForCompare(h2);
           if (!info2) { await reply(`❌ Could not fetch *${h2}*. Check the handle and try again.`); continue; }
-          await sleep(500);
-          const streak1 = await getCFStreak(h1);
-          await sleep(500);
-          const streak2 = await getCFStreak(h2);
           const r1 = info1.rating ?? -1;
           const r2 = info2.rating ?? -1;
           const s1 = info1.totalSolved || 0;
           const s2 = info2.totalSolved || 0;
           const c1 = info1.contests || 0;
           const c2 = info2.contests || 0;
-          const m1 = streak1?.max ?? 0;
-          const m2 = streak2?.max ?? 0;
+          // maxStreak is only null if the live fetch's submissions call failed
+          const m1 = info1.maxStreak ?? (await getCFStreak(h1))?.max ?? 0;
+          const m2 = info2.maxStreak ?? (await getCFStreak(h2))?.max ?? 0;
+          const rank1 = info1.rating ? titleCase(info1.rank) : "Unrated";
+          const rank2 = info2.rating ? titleCase(info2.rank) : "Unrated";
           let text = `⚔️ *${info1.handle}* vs *${info2.handle}*\n${"─".repeat(28)}\n\n`;
           text += `📊 *Rating*\n`;
-          text += `  ${rankEmoji(info1.rank)} ${info1.handle}: *${info1.rating ?? "Unrated"}* (${info1.rank})\n`;
-          text += `  ${rankEmoji(info2.rank)} ${info2.handle}: *${info2.rating ?? "Unrated"}* (${info2.rank})\n`;
+          text += `  ${rankEmoji(rank1)} ${info1.handle}: *${info1.rating ?? "Unrated"}* (${rank1})\n`;
+          text += `  ${rankEmoji(rank2)} ${info2.handle}: *${info2.rating ?? "Unrated"}* (${rank2})\n`;
           text += `  ${r1 === r2 ? "🤝 Tie" : r1 > r2 ? `🏆 ${info1.handle}` : `🏆 ${info2.handle}`}\n\n`;
           text += `✅ *Total Solved*\n`;
           text += `  ${info1.handle}: *${s1}*\n`;
